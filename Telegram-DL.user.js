@@ -15,8 +15,8 @@
 // @grant        none
 // @homepageURL  https://github.com/SakerLy/telegram-media-downloader
 // @supportURL   https://github.com/SakerLy/telegram-media-downloader/issues
-// @updateURL    https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.user.js
-// @downloadURL  https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.user.js
+// @updateURL    https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js
+// @downloadURL  https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js
 // ==/UserScript==
 
 (function () {
@@ -70,6 +70,9 @@
       seqNow: "Số kế tiếp: {n}",
       close: "Đóng",
       clearHistory: "Xoá lịch sử",
+      skippedDownloaded: "Bỏ qua {n} mục đã tải trước đó",
+      downloadedCount: "Đã nhớ {n} media đã tải (không tải lại)",
+      forgetDownloaded: "Quên hết",
       subfolder: "Thư mục con tự động",
       subfolderNone: "Không (lưu trực tiếp)",
       subfolderDate: "Theo ngày (2026-10-24)",
@@ -123,6 +126,9 @@
       seqNow: "Next number: {n}",
       close: "Close",
       clearHistory: "Clear history",
+      skippedDownloaded: "Skipped {n} already downloaded",
+      downloadedCount: "Remembering {n} downloaded media (won't re-download)",
+      forgetDownloaded: "Forget all",
       subfolder: "Auto subfolder",
       subfolderNone: "None (save flat)",
       subfolderDate: "By date (2026-10-24)",
@@ -286,6 +292,32 @@
   };
   const getMediaMetadata = (url) => {
     try { return JSON.parse(decodeURIComponent(url.split("/").pop())); } catch { return {}; }
+  };
+
+  // stable identity of a media file across re-renders. tweb's stream/photo URLs are
+  // `type/` + JSON(DownloadOptions) whose `location.id` is the file id (helpers/fileName.ts getFileURL);
+  // blob: URLs change on every render, so fall back to the message id tweb puts on the bubble /
+  // album item (bubbles.ts data-mid + data-peer-id).
+  const mediaKey = (url, el) => {
+    const loc = getMediaMetadata(url)?.location;
+    if (loc?.id) return `file:${loc.id}`;
+    const midEl = el?.closest?.("[data-mid]");
+    if (midEl?.dataset.mid) {
+      const peer = midEl.closest("[data-peer-id]")?.dataset.peerId || "";
+      return `msg:${peer}:${midEl.dataset.mid}`;
+    }
+    return `url:${url}`;
+  };
+
+  // remembers what was already saved so batch / auto-queue don't fetch it again on later visits
+  const DOWNLOADED_CAP = 5000;
+  let downloadedKeys = new Set(loadStore("downloaded", []));
+  const markDownloaded = (key) => {
+    if (!key || key.startsWith("url:")) return; // blob urls die with the page, not worth remembering
+    downloadedKeys.delete(key);
+    downloadedKeys.add(key);
+    if (downloadedKeys.size > DOWNLOADED_CAP) downloadedKeys = new Set([...downloadedKeys].slice(-DOWNLOADED_CAP));
+    saveStore("downloaded", [...downloadedKeys]);
   };
   const EXT_MAP = {
     "video/mp4": ["mp4", "m4v"], "video/webm": ["webm"], "video/quicktime": ["mov"],
@@ -496,7 +528,7 @@
       };
       card.querySelector('[data-act="retry"]').onclick = () => {
         dismissTask(task);
-        downloadMedia(task.url, task.kind);
+        downloadMedia(task.url, task.kind, { mediaKey: task.mediaKey });
       };
       list.prepend(card);
     }
@@ -541,6 +573,7 @@
     clearTimeout(task.progressTimer);
     task.state = state; task.error = error;
     if (activeDownloads.get(task.key) === task) activeDownloads.delete(task.key);
+    if (state === "completed" || state === "handedOff") markDownloaded(task.mediaKey);
     if (error) log.error(error.message || error, task.fileName);
     renderTask(task);
     updatePanel();
@@ -592,7 +625,8 @@
       else {
         const targetDir = await resolveDestDir();
         if (targetDir) {
-          const fh = await targetDir.getFileHandle(task.fileName, { create: true });
+          const { fh, name } = await uniqueFileHandle(targetDir, task.fileName);
+          task.fileName = name;
           const w = await fh.createWritable();
           await w.write(new Blob(parts, { type: mime }));
           await w.close();
@@ -621,9 +655,31 @@
       });
     }
   };
+  // never overwrite a file already in the folder: "a.jpg" → "a (1).jpg" → "a (2).jpg"
+  const uniqueFileHandle = async (dir, name) => {
+    const dot = name.lastIndexOf(".");
+    const base = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    for (let i = 0; i < 1000; i++) {
+      const candidate = i ? `${base} (${i})${ext}` : name;
+      try {
+        await dir.getFileHandle(candidate);
+      } catch (e) {
+        if (e?.name !== "NotFoundError") throw e;
+        return { fh: await dir.getFileHandle(candidate, { create: true }), name: candidate };
+      }
+    }
+    throw new Error(`too many files named ${name}`);
+  };
+
+  // opts.mediaKey: precomputed identity (from the DOM element); opts.skipDownloaded: batch/auto paths
+  // skip media already saved before. returns { state: "skipped" } in that case.
   const downloadMedia = (url, kind, opts = {}) => {
     if (typeof url !== "string" || !url) return Promise.resolve();
-    const key = `${kind}:${url}`;
+    const mk = opts.mediaKey || mediaKey(url);
+    if (opts.skipDownloaded && downloadedKeys.has(mk)) return Promise.resolve({ state: "skipped" });
+    // in-flight dedupe by media identity, not URL — the same file under a fresh blob URL is still the same file
+    const key = `${kind}:${mk}`;
     const existing = activeDownloads.get(key);
     if (existing) {
       if (!opts.silent) {
@@ -640,7 +696,7 @@
     }
     const task = {
       id: Math.random().toString(36).slice(2) + Date.now().toString(36),
-      key, url, kind,
+      key, url, kind, mediaKey: mk,
       fileName: getDownloadFileName(url, getMediaMetadata(url)?.mimeType, kind),
       state: "preparing", received: 0, total: null,
       controller: new AbortController(),
@@ -746,9 +802,11 @@
   const queueCurrentWebKMedia = () => {
     const r = resolveViewerWebKMedia();
     if (!r) return;
-    if (queuedViewerUrls.has(r.url)) return;
-    queuedViewerUrls.add(r.url);
-    downloadMedia(r.url, r.kind, { batch: true, silent: true });
+    // manual click: dedupe within this session only — an explicit click may re-download on purpose
+    const mk = mediaKey(r.url);
+    if (queuedViewerUrls.has(mk)) return;
+    queuedViewerUrls.add(mk);
+    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
     log.info(`queued: ${r.kind}`);
   };
 
@@ -768,7 +826,8 @@
   };
 
   // ===== bubble resolution for batch select =================================
-  const BUBBLE_SELECTORS = [".bubble", ".Message", "[data-mid]"].join(",");
+  // album items in tweb carry their own data-mid (prepareAlbum.ts), so [data-mid] must not count as a bubble
+  const BUBBLE_SELECTORS = [".bubble", ".Message"].join(",");
   const ALBUM_ITEM_SELECTOR = [
     ".grouped-item", ".album-item", "[class*='Album'] [class*='media']",
     ".media-container", ".Message__media-item",
@@ -809,7 +868,7 @@
     Array.from(document.querySelectorAll(BUBBLE_SELECTORS)).filter(bubbleHasMedia);
 
   const looksLikeUnopenedVideo = (scope) =>
-    !scope.querySelector("video") && !!scope.querySelector(VIDEO_HINT_SELECTOR);
+    !scope.querySelector("video") && (scopeIsVideoLike(scope) || !!scope.querySelector(VIDEO_HINT_SELECTOR));
 
   const resolveMediaElement = (el) => {
     if (!isRealAttachment(el)) return null;
@@ -822,15 +881,47 @@
     return null;
   };
 
+  // single source of truth for photo picking. a scope is a photo scope ONLY when:
+  //   - it has an <img.media-photo> (poster images on video posts use .thumbnail, not .media-photo)
+  //   - the scope does NOT contain <video> (so a video post's single <img.media-photo> poster — if ever —
+  //     and any video-time badge rule out the scope)
+  //   - the scope has no .video-time / .ckin__player / play-icon marker (unopened video thumbnail)
+  //   - the scope is NOT inside .reply, .webpage, avatar, sticker, reaction, etc.
+  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .Message__media-item";
+  const PHOTO_IMG_SELECTOR = "img.media-photo";
+  // tweb wrappers/video.ts: posters are drawn by wrapPhoto and get `media-photo` too, so the img class alone
+  // can't tell photo from video. these markers are only ever added for video/gif/round media.
+  const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player";
+  const scopeIsVideoLike = (scope) =>
+    scope.matches(VIDEO_MARKERS) || !!scope.querySelector(VIDEO_MARKERS);
+  const pickPhotoScopes = (root) =>
+    Array.from(root.querySelectorAll(PHOTO_SCOPE_SELECTOR)).filter((s) => {
+      if (s.closest(EXCLUDED_SCOPES)) return false;
+      const bubble = s.closest(".bubble, .Message");
+      if (!bubble || bubble.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
+      if (scopeIsVideoLike(s)) return false;
+      // if we're on an .attachment that itself holds .album-item children, defer to those (richer scopes)
+      if (s.matches(".attachment") && s.querySelector(".album-item")) return false;
+      return !!s.querySelector(PHOTO_IMG_SELECTOR);
+    });
+  const scopeToPhotoItem = (scope) => {
+    const img = Array.from(scope.querySelectorAll(PHOTO_IMG_SELECTOR))
+      // stripped blur placeholders also carry media-photo (photo.ts) but are ~40px; anything above 100px is the real image
+      .filter((i) => i.naturalWidth > 100 && !i.closest(EXCLUDED_SCOPES))
+      .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0];
+    if (!img) return null;
+    const url = getMediaSource(img);
+    return url ? { url, kind: "image", el: img, key: mediaKey(url, img) } : null;
+  };
+
   const resolveBubbleMediaAll = (bubble) => {
+    // kept for the auto-queue path which also handles video/audio; batch select uses pickPhotoScopes directly
     const results = [], seen = new Set();
     let skippedVideos = 0;
     const push = (item) => { if (!item || seen.has(item.url)) return; seen.add(item.url); results.push(item); };
     const attachments = Array.from(bubble.querySelectorAll(ATTACHMENT_CONTAINER))
       .filter((s) => !s.closest(EXCLUDED_SCOPES));
     if (!attachments.length) return { results, skippedVideos };
-    // tweb album wraps each piece in `.album-item` (its media child is `.album-item-media`);
-    // single photo/video posts have no album-item, so the whole .attachment is the scope.
     const scopes = [];
     for (const att of attachments) {
       const subs = att.querySelectorAll(".album-item");
@@ -843,10 +934,8 @@
       const audio = scope.querySelector("audio");
       if (audio) { push(resolveMediaElement(audio)); continue; }
       if (looksLikeUnopenedVideo(scope)) { skippedVideos++; continue; }
-      const img = Array.from(scope.querySelectorAll("img.media-photo, img.thumbnail, img"))
-        .filter((i) => i.naturalWidth > 200 && !i.closest(EXCLUDED_SCOPES))
-        .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0];
-      if (img) push(resolveMediaElement(img));
+      const item = scopeToPhotoItem(scope);
+      if (item) push(item);
     }
     return { results, skippedVideos };
   };
@@ -906,16 +995,24 @@
       updateSelectBar();
       return;
     }
-    const { results, skippedVideos } = resolveBubbleMediaAll(bubble);
-    const imagesOnly = results.filter((r) => r.kind === "image");
-    if (!imagesOnly.length) {
-      if (skippedVideos || results.length) log.info("skipped video — use Auto-queue in viewer");
+    // click path: pick photos directly via the strict scope resolver — never fall back to "largest img" (that caught video posters)
+    const scopes = pickPhotoScopes(bubble);
+    const items = [];
+    const seen = new Set();
+    for (const sc of scopes) {
+      const it = scopeToPhotoItem(sc);
+      if (it && !seen.has(it.key)) { seen.add(it.key); items.push(it); }
+    }
+    if (!items.length) {
+      // either a video post, or still-skeleton bubble — tell the user why nothing happened
+      const hasVideo = !!bubble.querySelector(".bubble .attachment video, .bubble .video-time");
+      log.info(hasVideo ? "video post — use Auto-queue in viewer" : "no post photo resolved yet (bubble not fully loaded)");
       return;
     }
     bubble.classList.add("sakerly-sel");
     selectedBubbles.add(bubble);
-    selectedItems.set(bubble, imagesOnly);
-    imagesOnly.forEach(paintTick);
+    selectedItems.set(bubble, items);
+    items.forEach(paintTick);
     updateSelectBar();
   };
   const clearSelection = () => {
@@ -928,7 +1025,10 @@
     updateSelectBar();
   };
   const rangeSelect = (from, to) => {
-    const list = allBubbles();
+    // tweb keeps other chats' bubble lists mounted; only walk the list both clicks belong to
+    const container = from.closest(".bubbles-inner, .bubbles, .MessageList");
+    if (!container || !container.contains(to)) return;
+    const list = Array.from(container.querySelectorAll(BUBBLE_SELECTORS)).filter(bubbleHasMedia);
     const i1 = list.indexOf(from), i2 = list.indexOf(to);
     if (i1 < 0 || i2 < 0) return;
     const [a, b] = i1 < i2 ? [i1, i2] : [i2, i1];
@@ -1005,13 +1105,13 @@
     }
     /* per-media tick: dropped on each selected photo element (album item or single photo) */
     .sakerly-sel-item {
-      position: relative; z-index: 2147483000;
+      position: relative;
       outline: 4px solid var(--sk-ok) !important; outline-offset: -4px;
       box-shadow: 0 0 0 4px rgba(34,197,94,.3), 0 0 20px 2px rgba(34,197,94,.55) !important;
       border-radius: 6px;
     }
     .sakerly-tick {
-      position: absolute; top: 6px; left: 6px; z-index: 2147483001;
+      position: absolute; top: 6px; left: 6px; z-index: 2;
       width: 28px; height: 28px; border-radius: 50%;
       background: var(--sk-ok); color: #04150a;
       font: 900 16px/28px system-ui; text-align: center;
@@ -1160,15 +1260,6 @@
       font-size: 11.5px; color: var(--sk-muted); font-weight: 600;
       background: var(--sk-bg-head);
     }
-    #sakerly-panel .sakerly-panel-foot select {
-      appearance: none; background: var(--sk-track); color: var(--sk-fg);
-      border: 0; border-radius: 6px; padding: 4px 24px 4px 8px;
-      font: inherit; cursor: pointer;
-      background-image: linear-gradient(45deg, transparent 50%, var(--sk-muted) 50%),
-                        linear-gradient(135deg, var(--sk-muted) 50%, transparent 50%);
-      background-position: calc(100% - 12px) center, calc(100% - 7px) center;
-      background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
-    }
 
     #sakerly-select-bar .sakerly-select-body {
       display: flex; flex-direction: column; min-height: 0;
@@ -1301,7 +1392,19 @@
     #sakerly-settings-modal button:hover:not(:disabled) {
       background: var(--sk-accent); color: var(--sk-accent-fg);
     }
-    #sakerly-settings-modal button:disabled { opacity: .5; cursor: default; }
+    #sakerly-settings-modal button:disabled,
+    #sakerly-settings-modal select:disabled { opacity: .5; cursor: not-allowed; }
+    #sakerly-settings-modal .sakerly-settings-pickdir {
+      background: var(--sk-accent); color: var(--sk-accent-fg);
+    }
+    #sakerly-settings-modal .sakerly-settings-pickdir:hover:not(:disabled) { filter: brightness(1.08); }
+    #sakerly-settings-modal .sakerly-settings-cleardir {
+      background: transparent; color: var(--sk-err);
+      box-shadow: inset 0 0 0 1px var(--sk-line);
+    }
+    #sakerly-settings-modal .sakerly-settings-cleardir:hover {
+      background: var(--sk-err); color: #fff; box-shadow: none;
+    }
     #sakerly-settings-modal .sakerly-folder-row {
       display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     }
@@ -1356,12 +1459,6 @@
     <div class="sakerly-task-list"></div>
     <div class="sakerly-panel-foot">
       <span>SakerLy</span>
-      <span style="flex:1"></span>
-      <label>${t("lang")}</label>
-      <select class="sakerly-lang-select">
-        <option value="vi">VI</option>
-        <option value="en">EN</option>
-      </select>
     </div>
   `;
   document.body.appendChild(panel);
@@ -1371,13 +1468,6 @@
     panel.classList.toggle("collapsed", col);
     panelToggle.textContent = col ? "+" : "–";
     panelToggle.title = col ? t("show") : t("hide");
-  };
-  const langSelect = panel.querySelector(".sakerly-lang-select");
-  langSelect.value = currentLang;
-  langSelect.onchange = () => {
-    currentLang = langSelect.value;
-    saveStore("lang", currentLang);
-    refreshAllLabels();
   };
   makeDraggable(panel, panel.querySelector(".sakerly-head"), "panelPos");
 
@@ -1398,6 +1488,13 @@
       </div>
       <div class="sakerly-settings-body">
         <label class="sakerly-field">
+          <span class="sakerly-field-label" data-key="lang"></span>
+          <select class="sakerly-lang-select">
+            <option value="vi">Tiếng Việt</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <label class="sakerly-field">
           <span class="sakerly-field-label" data-key="naming"></span>
           <select class="sakerly-settings-naming">
             <option value="original" data-key="namingOriginal"></option>
@@ -1415,14 +1512,18 @@
           <span class="sakerly-field-label sakerly-seq-info"></span>
           <button type="button" class="sakerly-settings-resetseq"></button>
         </div>
-        <label class="sakerly-field">
+        <div class="sakerly-field sakerly-seq-row">
+          <span class="sakerly-field-label sakerly-seq-info sakerly-downloaded-info"></span>
+          <button type="button" class="sakerly-settings-forget"></button>
+        </div>
+        <div class="sakerly-field">
           <span class="sakerly-field-label" data-key="folder"></span>
           <div class="sakerly-folder-row">
             <span class="sakerly-folder-name"></span>
             <button type="button" class="sakerly-settings-pickdir"></button>
             <button type="button" class="sakerly-settings-cleardir"></button>
           </div>
-        </label>
+        </div>
         <label class="sakerly-field">
           <span class="sakerly-field-label" data-key="subfolder"></span>
           <select class="sakerly-settings-subfolder">
@@ -1447,12 +1548,23 @@
   const settingsFolderName = settingsModal.querySelector(".sakerly-folder-name");
   const settingsResetSeq = settingsModal.querySelector(".sakerly-settings-resetseq");
   const settingsSeqInfo = settingsModal.querySelector(".sakerly-seq-info");
+  const settingsDownloadedInfo = settingsModal.querySelector(".sakerly-downloaded-info");
+  const settingsForget = settingsModal.querySelector(".sakerly-settings-forget");
   const settingsSubfolder = settingsModal.querySelector(".sakerly-settings-subfolder");
+  const langSelect = settingsModal.querySelector(".sakerly-lang-select");
+  langSelect.value = currentLang;
+  langSelect.onchange = () => {
+    currentLang = langSelect.value;
+    saveStore("lang", currentLang);
+    refreshAllLabels();
+    refreshSettingsUI();
+  };
 
   const refreshSettingsUI = () => {
     settingsModal.querySelector(".sakerly-settings-title").textContent = t("settingsTitle");
     settingsCloseBtn.title = t("close");
     settingsModal.querySelectorAll("[data-key]").forEach((el) => { el.textContent = t(el.dataset.key); });
+    langSelect.value = currentLang;
     settingsNaming.value = settings.naming;
     settingsSubfolder.value = settings.subfolder || "none";
     settingsSubfolder.disabled = !destDirName;
@@ -1467,6 +1579,9 @@
     settingsClearDir.hidden = !destDirName;
     settingsResetSeq.textContent = t("resetSeq");
     settingsSeqInfo.textContent = t("seqNow", { n: seqCounter });
+    settingsDownloadedInfo.textContent = t("downloadedCount", { n: downloadedKeys.size });
+    settingsForget.textContent = t("forgetDownloaded");
+    settingsForget.disabled = downloadedKeys.size === 0;
     settingsCogBtn.title = t("settings");
   };
 
@@ -1480,10 +1595,24 @@
   settingsCogBtn.onclick = () => { settingsModal.hidden = false; refreshSettingsUI(); };
   settingsCloseBtn.onclick = () => { settingsModal.hidden = true; };
   settingsModal.querySelector(".sakerly-modal-backdrop").onclick = () => { settingsModal.hidden = true; };
+  // capture phase so Telegram's own Esc handler (closing the chat/viewer) doesn't fire while the modal is open
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !settingsModal.hidden) {
+      e.preventDefault(); e.stopPropagation();
+      settingsModal.hidden = true;
+    }
+  }, true);
   settingsNaming.onchange = () => { settings.naming = settingsNaming.value; saveStore("settings", settings); refreshSettingsUI(); };
   settingsSubfolder.onchange = () => { settings.subfolder = settingsSubfolder.value; saveStore("settings", settings); refreshSettingsUI(); };
   settingsPrefix.oninput = () => { settings.prefix = settingsPrefix.value; saveStore("settings", settings); };
   settingsResetSeq.onclick = () => { seqCounter = 1; saveStore("seq", 1); refreshSettingsUI(); };
+  settingsForget.onclick = () => {
+    downloadedKeys = new Set();
+    saveStore("downloaded", []);
+    seenAutoQueueUrls.clear();
+    queuedViewerUrls.clear();
+    refreshSettingsUI();
+  };
   settingsPickDir.onclick = async () => {
     if (!supportsDirPicker) return;
     try {
@@ -1611,53 +1740,64 @@
     const visX = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
     return visY >= 40 && visX >= 40;
   };
+  // "Select all visible": additive — scroll, press again, and the new on-screen photos join the existing
+  // selection. Only photos currently on screen are added; "Clear" resets. Deduped by media identity.
   selAllBtn.onclick = () => {
-    clearSelection();
-    const imgs = Array.from(document.querySelectorAll(
-      ".bubble .attachment img.media-photo, .bubble .attachment img.thumbnail, .Message__media-item img"
-    )).filter((img) =>
-      img.naturalWidth > 200 &&
-      !img.closest(EXCLUDED_SCOPES) &&
-      !img.closest(EXCLUDED_BUBBLE_CLASSES) &&
-      isElementVisibleInViewport(img)
-    );
-    const byBubble = new Map();
-    for (const img of imgs) {
-      const bubble = img.closest(".bubble, .Message");
+    const seen = new Set();
+    for (const items of selectedItems.values()) for (const it of items) seen.add(it.key);
+    const scopes = pickPhotoScopes(document).filter((sc) => {
+      const img = sc.querySelector(PHOTO_IMG_SELECTOR);
+      return img && isElementVisibleInViewport(img);
+    });
+    let added = 0;
+    for (const sc of scopes) {
+      const item = scopeToPhotoItem(sc);
+      if (!item || seen.has(item.key)) continue;
+      seen.add(item.key);
+      const bubble = sc.closest(".bubble, .Message");
       if (!bubble) continue;
-      if (!byBubble.has(bubble)) byBubble.set(bubble, []);
-      byBubble.get(bubble).push(img);
-    }
-    for (const [bubble, bubbleImgs] of byBubble) {
-      const items = [];
-      const seen = new Set();
-      for (const img of bubbleImgs) {
-        const url = getMediaSource(img);
-        if (!url || seen.has(url)) continue;
-        seen.add(url);
-        items.push({ url, kind: "image", el: img });
-      }
-      if (!items.length) continue;
-      bubble.classList.add("sakerly-sel");
+      const list = selectedItems.get(bubble) || [];
+      list.push(item);
+      selectedItems.set(bubble, list);
       selectedBubbles.add(bubble);
-      selectedItems.set(bubble, items);
-      items.forEach(paintTick);
+      bubble.classList.add("sakerly-sel");
+      paintTick(item);
+      added++;
     }
+    log.info(`select-visible: +${added} (total ${totalSelectedItems()})`);
     updateSelectBar();
+  };
+  // brief inline feedback on the download button (there is no toast system)
+  const flashDlButton = (text) => {
+    selDlBtn.textContent = text;
+    clearTimeout(flashDlButton.timer);
+    flashDlButton.timer = setTimeout(updateSelectBar, 2500);
   };
   selDlBtn.onclick = () => {
     const items = [...selectedItems.values()].flat();
     if (!items.length) return;
-    for (const it of items) downloadMedia(it.url, it.kind, { batch: true, silent: true });
-    log.info(t("batchQueued", { count: items.length }));
+    let queued = 0, skipped = 0;
+    for (const it of items) {
+      if (downloadedKeys.has(it.key)) { skipped++; continue; }
+      downloadMedia(it.url, it.kind, { batch: true, silent: true, mediaKey: it.key });
+      queued++;
+    }
+    log.info(`batch: queued ${queued}, skipped ${skipped} already downloaded`);
     clearSelection();
+    if (skipped) flashDlButton(t("skippedDownloaded", { n: skipped }));
   };
 
-  // click handler for select mode
+  // click handler for select mode. we intercept any click inside a bubble that has at least one
+  // real photo scope — the strict picker is applied inside markSelected, so a click on a video post
+  // short-circuits with a log line rather than silently doing nothing.
+  const bubbleIsSelectable = (b) => {
+    if (!b || b.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
+    return !!b.querySelector(PHOTO_SCOPE_SELECTOR);
+  };
   document.addEventListener("click", (e) => {
     if (!selectMode) return;
     const b = findBubble(e.target);
-    if (!b || !bubbleHasMedia(b)) return;
+    if (!b || !bubbleIsSelectable(b)) return;
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
     if (e.shiftKey && lastClickedBubble) rangeSelect(lastClickedBubble, b);
     else markSelected(b, !selectedBubbles.has(b));
@@ -1721,11 +1861,16 @@
     // auto-queue video when viewer resolves to a new URL, then auto-advance to next in album
     if (autoQueueMode) {
       const r = resolveViewerWebKMedia();
-      if (r && !seenAutoQueueUrls.has(r.url)) {
-        seenAutoQueueUrls.add(r.url);
-        queuedViewerUrls.add(r.url);
-        downloadMedia(r.url, r.kind, { batch: true, silent: true });
-        log.info(`auto-queue: ${r.kind}`);
+      const mk = r && mediaKey(r.url);
+      if (r && !seenAutoQueueUrls.has(mk)) {
+        seenAutoQueueUrls.add(mk);
+        queuedViewerUrls.add(mk);
+        // still advance past media saved on an earlier visit, just don't fetch it again
+        if (downloadedKeys.has(mk)) log.info(`auto-queue: skip ${r.kind}, already downloaded`);
+        else {
+          downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
+          log.info(`auto-queue: ${r.kind}`);
+        }
         setTimeout(autoAdvanceViewer, 400);
       }
     }
