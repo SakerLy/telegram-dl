@@ -25,7 +25,7 @@ Chọn **một** tiện ích phù hợp với trình duyệt:
 
 Nhấn vào link raw để Tampermonkey tự nhận:
 
-**[Cài Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.user.js)**
+**[Cài Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/Telegram-Media-Downloader/refs/heads/main/Telegram-DL.js)**
 
 Tampermonkey mở tab xác nhận → bấm **Install**.
 
@@ -91,7 +91,7 @@ Script tự check update qua Tampermonkey. Mặc định mỗi 24h kiểm tra 1 
 
 ### 2. Install the script
 
-**[Install Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.user.js)**
+**[Install Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/Telegram-Media-Downloader/refs/heads/main/Telegram-DL.js)**
 
 Click **Install** when Tampermonkey opens the install page.
 

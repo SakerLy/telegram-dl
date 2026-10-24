@@ -15,8 +15,8 @@
 // @grant        none
 // @homepageURL  https://github.com/SakerLy/telegram-media-downloader
 // @supportURL   https://github.com/SakerLy/telegram-media-downloader/issues
-// @updateURL    https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.meta.js
-// @downloadURL  https://raw.githubusercontent.com/SakerLy/telegram-media-downloader/main/Telegram-DL.user.js
+// @updateURL    https://raw.githubusercontent.com/SakerLy/Telegram-Media-Downloader/refs/heads/main/Telegram-DL.js
+// @downloadURL  https://raw.githubusercontent.com/SakerLy/Telegram-Media-Downloader/refs/heads/main/Telegram-DL.js
 // ==/UserScript==
 
 (function () {
