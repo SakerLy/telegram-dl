@@ -1,210 +1,153 @@
 # Telegram Media Downloader
 
-Userscript tải ảnh, GIF, video và voice từ **Telegram Web** — kể cả kênh bật *noforwards* (cấm lưu/forward).
+Userscript tải ảnh, video, GIF và voice từ **Telegram Web**, kể cả kênh bật chặn lưu nội dung.
+A userscript to download photos, videos, GIFs and voice messages from **Telegram Web**, including channels that restrict saving content.
 
-Hỗ trợ:
-- `web.telegram.org/k/` (WebK)
-- `web.telegram.org/a/` · `web.telegram.org/z/` (WebA / WebZ)
-- `webk.telegram.org`, `webz.telegram.org`
+[Tiếng Việt](#tiếng-việt) · [English](#english) · [Changelog](CHANGELOG.md)
 
 ---
 
 ## Tiếng Việt
 
-### 1. Cài trình quản lý userscript
+### Tính năng
 
-Chọn **một** tiện ích phù hợp với trình duyệt:
+- Tải từng file ngay trong trình xem media
+- Chọn và tải hàng loạt ảnh, có dấu tick trên từng ảnh
+- Auto-queue: tự tải toàn bộ video trong một post, dừng khi hết video
+- Chống trùng: không tải lại media đã tải, không ghi đè file
+- Tuỳ chỉnh tên file, thư mục lưu và thư mục con theo ngày hoặc kênh
+- Giao diện tiếng Việt và tiếng Anh, tự cập nhật phiên bản mới
 
-| Trình duyệt | Tiện ích |
+Hỗ trợ `web.telegram.org/k/` (WebK) và `web.telegram.org/a/` (WebA). Một số tính năng như Auto-queue chỉ có trên WebK.
+
+### Cài đặt
+
+1. Cài một trình quản lý userscript:
+   - Chrome, Edge, Brave, Opera: [Tampermonkey](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
+   - Firefox: [Tampermonkey](https://addons.mozilla.org/firefox/addon/tampermonkey/) hoặc [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/)
+2. Mở [link cài script](https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js) rồi bấm **Install**.
+3. Mở hoặc tải lại `https://web.telegram.org/`.
+
+### Sử dụng
+
+**Tải một file.** Mở ảnh hoặc video trong trình xem, bấm nút tải trên thanh công cụ phía trên.
+
+**Tải hàng loạt ảnh.**
+1. Bật **Chế độ chọn** trong panel *Chọn hàng loạt*.
+2. Click vào post ảnh để chọn, Shift+Click để chọn một dải. Hoặc bấm **Chọn tất cả hiển thị**: bấm lại sau khi cuộn để cộng thêm ảnh mới.
+3. Bấm **Tải mục đã chọn**.
+
+**Tải video.** Video chỉ có nguồn tải khi được mở trong trình xem, vì vậy dùng **Auto-queue**:
+1. Bật **Auto-queue video**.
+2. Click vào media đầu tiên của post. Script đếm số video trong post ngay lúc này.
+3. Script tự tải từng video, bỏ qua ảnh, tự chuyển slide và dừng khi đủ video của post.
+
+### Cài đặt nâng cao
+
+Bấm biểu tượng bánh răng trên panel.
+
+| Mục | Mô tả |
 |---|---|
-| Chrome / Edge / Brave / Opera | [Tampermonkey](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo) |
-| Firefox | [Tampermonkey](https://addons.mozilla.org/firefox/addon/tampermonkey/) · hoặc [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/) |
-| Safari | [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) |
+| Ngôn ngữ | Tiếng Việt hoặc English |
+| Định dạng tên file | Tên gốc, ngày giờ, số thứ tự, hoặc kết hợp |
+| Tiền tố | Chuỗi thêm vào đầu tên file |
+| Thư mục lưu | Lưu vào thư mục riêng thay cho Downloads |
+| Thư mục con tự động | Theo ngày, theo kênh, hoặc kết hợp. Cần chọn thư mục lưu trước. |
+| Media đã tải | Số media đã nhớ để không tải lại, có nút **Quên hết** |
 
-### 2. Cài script
+Thư mục lưu và thư mục con chỉ dùng được trên Chrome, Edge, Brave và Opera. Trên Brave cần bật `brave://flags/#file-system-access-api` rồi khởi động lại trình duyệt. Sau mỗi lần khởi động lại trình duyệt, lần tải đầu tiên sẽ hỏi lại quyền ghi thư mục.
 
-Nhấn vào link raw để Tampermonkey tự nhận:
-
-**[Cài Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js)**
-
-Tampermonkey mở tab xác nhận → bấm **Install**.
-
-### 3. Dùng
-
-Mở `https://web.telegram.org/` — 2 panel xuất hiện:
-- **Panel trên-phải**: *Chọn hàng loạt*
-- **Panel dưới-phải**: *Tải xuống* (chỉ hiện khi có task)
-
-#### Tải một file
-Mở ảnh/video trong viewer → bấm **⤓** ở topbar.
-
-#### Tải hàng loạt ảnh
-1. Bấm **Chế độ chọn** trong panel
-2. Click vào từng bubble ảnh (viền xanh = đã chọn)
-3. Shift+Click = chọn một dải
-4. Bấm **Tải mục đã chọn (N)**
-
-#### Tải hàng loạt video (noforwards channel)
-Video chỉ load src khi mở viewer. Dùng **Auto-queue**:
-1. Bấm **Auto-queue video** (nền xanh = bật)
-2. Click vào media đầu tiên của post để mở viewer. Lúc click, script đếm sẵn post có bao nhiêu video.
-3. Script tự thêm từng video vào hàng chờ và tự chuyển slide. Ảnh trong post được bỏ qua, không tải.
-4. Khi đã gặp đủ số video của post, hoặc tới item cuối của post, script dừng lại và nút tải hiện "Xong post: N video". Nó không chạy sang post khác.
-5. Muốn tải post khác: đóng viewer và click vào post đó.
-
-### 4. Phím tắt
+### Phím tắt
 
 | Phím | Chức năng |
 |---|---|
-| `Ctrl + Shift + M` | Bật/tắt Chế độ chọn |
-| `Ctrl + Shift + A` | Bật/tắt Auto-queue |
-| `Ctrl + Shift + D` | Tải mục đã chọn |
+| `Ctrl+Shift+M` | Bật/tắt Chế độ chọn |
+| `Ctrl+Shift+A` | Bật/tắt Auto-queue |
+| `Ctrl+Shift+D` | Tải mục đã chọn |
 
-### 5. Cài đặt
+### Xử lý sự cố
 
-Bấm nút bánh răng trên panel (panel nào cũng được) để mở Cài đặt.
-
-| Mục | Ý nghĩa |
+| Hiện tượng | Cách xử lý |
 |---|---|
-| Ngôn ngữ | Tiếng Việt / English. Mặc định theo ngôn ngữ trình duyệt. |
-| Định dạng tên file | Tên gốc · Ngày giờ · Số thứ tự · Ngày giờ + Tên gốc · Số thứ tự + Tên gốc |
-| Tiền tố | Chuỗi thêm vào đầu tên file, ví dụ tên kênh. Có thể để trống. |
-| Số thứ tự | Hiện số kế tiếp, có nút đặt lại về 1. |
-| Thư mục lưu | Chọn một thư mục riêng thay cho Downloads mặc định. |
-| Thư mục con tự động | Theo ngày · Theo kênh · Ngày / Kênh · Kênh / Ngày. Chỉ bật được sau khi đã chọn thư mục lưu. |
+| Không thấy panel | Tải lại trang, kiểm tra script đang bật trong Tampermonkey |
+| Nút **Chọn thư mục** bị xám | Trình duyệt không hỗ trợ, hoặc Brave chưa bật flag ở trên |
+| Click vào video không chọn được | Chế độ chọn chỉ dành cho ảnh, dùng Auto-queue cho video |
+| Ảnh vừa cuộn tới không được chọn | Đợi ảnh tải xong rồi bấm lại |
+| Lỗi khác | Mở Console (F12), gửi các dòng `[sakerly]` kèm ảnh chụp vào Issues |
 
-#### Lưu vào thư mục riêng và tạo thư mục con
-
-1. Cài đặt → **Thư mục lưu** → **Chọn thư mục** → chọn hoặc tạo thư mục, ví dụ `D:\Telegram`.
-2. Trình duyệt hỏi có cho trang sửa file trong thư mục đó không → bấm **Lưu thay đổi** (Allow).
-3. Ở **Thư mục con tự động**, chọn kiểu muốn dùng. Ví dụ chọn *Kênh / Ngày* thì file được lưu vào `D:\Telegram\TênKênh\2026-10-24\`. Thư mục chưa có thì script tự tạo.
-
-Lưu ý:
-- Chỉ hỗ trợ Chrome, Edge, Brave và Opera. Firefox và Safari không có API chọn thư mục, file sẽ vào Downloads mặc định.
-- Sau khi tắt hẳn trình duyệt rồi mở lại, lần tải đầu tiên trình duyệt sẽ hỏi lại quyền. Nếu từ chối, file rơi về Downloads mặc định.
-- Tên kênh lấy theo chat đang mở tại thời điểm file lưu xong. Đừng chuyển chat khi batch còn đang tải.
-
-#### Brave: nút "Chọn thư mục" bị xám
-
-Brave tắt sẵn File System Access API. Cách bật:
-
-1. Mở tab mới, vào `brave://flags/#file-system-access-api`
-2. Chuyển **File System Access API** sang **Enabled**
-3. Bấm **Relaunch** để khởi động lại Brave
-4. Mở lại web.telegram.org → Cài đặt → nút **Chọn thư mục** đã bấm được.
-
-### 6. Auto update
-
-Script tự check update qua Tampermonkey. Mặc định mỗi 24h kiểm tra 1 lần.
-
-**Bật/tắt thủ công**: Tampermonkey → Dashboard → mở script → tab **Settings** → mục *Updates* → chọn khoảng kiểm tra.
-
-**Cập nhật ngay**: Tampermonkey → Dashboard → nút **Check for userscript updates**.
-
-### 7. Troubleshoot
-
-| Triệu chứng | Cách xử lý |
-|---|---|
-| Không thấy panel | F5 lại trang. Kiểm tra Tampermonkey đã bật script chưa. |
-| Nút "Chọn thư mục" bị xám | Trình duyệt không hỗ trợ hoặc đang tắt API. Với Brave xem mục *Brave* ở trên. |
-| Ô "Thư mục con tự động" bị xám | Chưa chọn thư mục lưu. Chọn thư mục trước. |
-| Video chọn ra ảnh | Video chưa mở viewer — dùng Auto-queue thay vì chọn bubble trực tiếp. |
-| Tải HTTP 403 | Kênh đã đóng hoặc URL hết hạn, mở lại viewer để refresh. |
-| Treo lúc tải | Mở DevTools Console → copy log `[sakerly]` + screenshot gửi vào Issues. |
+Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampermonkey → Dashboard → **Check for userscript updates**.
 
 ---
 
 ## English
 
-### 1. Install a userscript manager
+### Features
 
-| Browser | Extension |
+- Download any single file from the media viewer
+- Batch-select and download photos, with a tick on each selected photo
+- Auto-queue: downloads every video in a post and stops when they're done
+- Duplicate protection: skips media already downloaded, never overwrites files
+- Configurable file names, destination folder and date/channel subfolders
+- Vietnamese and English UI, automatic updates
+
+Supports `web.telegram.org/k/` (WebK) and `web.telegram.org/a/` (WebA). Some features, such as Auto-queue, are WebK only.
+
+### Installation
+
+1. Install a userscript manager:
+   - Chrome, Edge, Brave, Opera: [Tampermonkey](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
+   - Firefox: [Tampermonkey](https://addons.mozilla.org/firefox/addon/tampermonkey/) or [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/)
+2. Open the [install link](https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js) and click **Install**.
+3. Open or reload `https://web.telegram.org/`.
+
+### Usage
+
+**Single file.** Open the photo or video in the viewer and click the download button in the top bar.
+
+**Batch photos.**
+1. Enable **Select mode** in the *Batch select* panel.
+2. Click photo posts to select them, Shift+Click to select a range. Or press **Select all visible**: press it again after scrolling to add more.
+3. Click **Download selected**.
+
+**Videos.** A video only has a downloadable source once it's open in the viewer, so use **Auto-queue**:
+1. Enable **Auto-queue video**.
+2. Click the first media of a post. The script counts the post's videos at that moment.
+3. It downloads each video, skips photos, advances slides by itself and stops once the post's videos are done.
+
+### Settings
+
+Click the gear icon on either panel.
+
+| Option | Description |
 |---|---|
-| Chrome / Edge / Brave / Opera | [Tampermonkey](https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo) |
-| Firefox | [Tampermonkey](https://addons.mozilla.org/firefox/addon/tampermonkey/) · [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/) |
-| Safari | [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) |
+| Language | Tiếng Việt or English |
+| File naming | Original name, date-time, sequence number, or a combination |
+| Prefix | Text prepended to every file name |
+| Destination folder | Save into a folder of your choice instead of Downloads |
+| Auto subfolder | By date, by channel, or both. Requires a destination folder. |
+| Downloaded media | How many media are remembered and won't be downloaded again, with a **Forget all** button |
 
-### 2. Install the script
+Destination folder and subfolders work on Chrome, Edge, Brave and Opera only. On Brave, enable `brave://flags/#file-system-access-api` and relaunch. After each browser restart, the first download asks for folder permission again.
 
-**[Install Telegram Media Downloader](https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js)**
-
-Click **Install** when Tampermonkey opens the install page.
-
-### 3. Usage
-
-Open `https://web.telegram.org/` — two panels appear:
-- **Top-right**: *Batch select*
-- **Bottom-right**: *Downloads* (only when active)
-
-#### Single file
-Open the media in viewer → click **⤓** on the topbar.
-
-#### Batch photos
-1. Toggle **Select mode**
-2. Click each photo bubble
-3. Shift+Click for range select
-4. **Download selected (N)**
-
-#### Batch videos (noforwards channels)
-Videos only have a src once the viewer is opened. Use **Auto-queue**:
-1. Toggle **Auto-queue video**
-2. Click the first media of a post to open the viewer. On that click the script counts the post's videos.
-3. Each video is queued and the viewer auto-advances. Photos in the post are skipped, not downloaded.
-4. Once every video of the post was seen, or the post's last item is reached, it stops and the download button shows "Post done: N video(s)". It never runs on into other posts.
-5. For another post: close the viewer and click that post.
-
-### 4. Shortcuts
+### Shortcuts
 
 | Key | Action |
 |---|---|
-| `Ctrl + Shift + M` | Toggle Select mode |
-| `Ctrl + Shift + A` | Toggle Auto-queue |
-| `Ctrl + Shift + D` | Download selected |
+| `Ctrl+Shift+M` | Toggle Select mode |
+| `Ctrl+Shift+A` | Toggle Auto-queue |
+| `Ctrl+Shift+D` | Download selected |
 
-### 5. Settings
+### Troubleshooting
 
-Click the gear icon on either panel to open Settings.
-
-| Option | What it does |
+| Problem | Fix |
 |---|---|
-| Language | Tiếng Việt / English. Defaults to the browser language. |
-| File naming | Original · Date-time · Sequence · Date + Original · Sequence + Original |
-| Prefix | Optional text prepended to every file name, e.g. the channel name. |
-| Sequence | Shows the next number, with a reset-to-1 button. |
-| Destination folder | Save into a folder of your choice instead of the default Downloads folder. |
-| Auto subfolder | By date · By channel · Date / Channel · Channel / Date. Only available after a destination folder is picked. |
+| Panels don't appear | Reload the page and check the script is enabled in Tampermonkey |
+| **Pick folder** is greyed out | Browser not supported, or the Brave flag above isn't enabled |
+| Clicking a video doesn't select it | Select mode is for photos only; use Auto-queue for videos |
+| A photo just scrolled into view isn't selected | Wait for it to finish loading, then press again |
+| Anything else | Open the Console (F12) and send the `[sakerly]` lines plus a screenshot to Issues |
 
-#### Saving into a custom folder with subfolders
-
-1. Settings → **Destination folder** → **Pick folder** → choose or create a folder, e.g. `D:\Telegram`.
-2. The browser asks whether the site may edit files in that folder → click **Save changes** (Allow).
-3. Under **Auto subfolder**, choose a layout. With *Channel / Date*, files go to `D:\Telegram\ChannelName\2026-10-24\`. Missing folders are created automatically.
-
-Notes:
-- Chrome, Edge, Brave and Opera only. Firefox and Safari have no folder-picker API, so files go to the default Downloads folder.
-- After fully restarting the browser, it asks for permission again on the first download. If you decline, files fall back to Downloads.
-- The channel name is taken from the chat open when each file finishes saving. Don't switch chats while a batch is still downloading.
-
-#### Brave: "Pick folder" is greyed out
-
-Brave disables the File System Access API by default. To enable it:
-
-1. Open `brave://flags/#file-system-access-api`
-2. Set **File System Access API** to **Enabled**
-3. Click **Relaunch**
-4. Reopen web.telegram.org → Settings → **Pick folder** now works.
-
-### 6. Auto update
-
-Tampermonkey checks for updates every 24h by default via `@updateURL` / `@downloadURL`.
-
-**Manual check**: Tampermonkey → Dashboard → **Check for userscript updates**.
-
----
-
-## Changelog
-
-Xem / See [CHANGELOG.md](CHANGELOG.md).
+The script checks for updates every 24 hours. To check now: Tampermonkey → Dashboard → **Check for userscript updates**.
 
 ---
 
