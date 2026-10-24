@@ -70,6 +70,12 @@
       seqNow: "Số kế tiếp: {n}",
       close: "Đóng",
       clearHistory: "Xoá lịch sử",
+      subfolder: "Thư mục con tự động",
+      subfolderNone: "Không (lưu trực tiếp)",
+      subfolderDate: "Theo ngày (2026-10-24)",
+      subfolderChannel: "Theo kênh/chat",
+      subfolderDateChannel: "Ngày / Kênh",
+      subfolderChannelDate: "Kênh / Ngày",
     },
     en: {
       downloads: "Downloads", downloadsCount: "Downloads ({count})",
@@ -117,6 +123,12 @@
       seqNow: "Next number: {n}",
       close: "Close",
       clearHistory: "Clear history",
+      subfolder: "Auto subfolder",
+      subfolderNone: "None (save flat)",
+      subfolderDate: "By date (2026-10-24)",
+      subfolderChannel: "By channel/chat",
+      subfolderDateChannel: "Date / Channel",
+      subfolderChannelDate: "Channel / Date",
     },
   };
 
@@ -317,7 +329,7 @@
   };
 
   // ===== settings: file naming + destination folder =========================
-  const DEFAULT_SETTINGS = { naming: "original", prefix: "" };
+  const DEFAULT_SETTINGS = { naming: "original", prefix: "", subfolder: "none" };
   let settings = Object.assign({}, DEFAULT_SETTINGS, loadStore("settings", {}));
   let seqCounter = loadStore("seq", 1);
 
@@ -371,6 +383,42 @@
     const d = new Date();
     return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
   };
+  // peer/channel title from the open chat header. tweb puts it in `.chat .user-title` (with .peer-title inside);
+  // falls back to document.title stripped of the "Telegram" suffix if the DOM selector misses.
+  const sanitizeSegment = (s) => (s || "").replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_").trim().slice(0, 80);
+  const todaySegment = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  };
+  const currentChannelName = () => {
+    const el = document.querySelector(".chat .user-title, .chat-info .user-title, .chat-utils ~ * .user-title");
+    const direct = el?.querySelector(".peer-title")?.textContent || el?.textContent;
+    if (direct && direct.trim()) return sanitizeSegment(direct);
+    const t = (document.title || "").replace(/\s*[-·]?\s*Telegram\s*$/i, "").trim();
+    return sanitizeSegment(t) || "Unknown";
+  };
+  const subfolderSegments = () => {
+    switch (settings.subfolder) {
+      case "date": return [todaySegment()];
+      case "channel": return [currentChannelName()];
+      case "date_channel": return [todaySegment(), currentChannelName()];
+      case "channel_date": return [currentChannelName(), todaySegment()];
+      default: return [];
+    }
+  };
+  // walk/create the chain of subfolders under the user-picked root; each segment opens with { create: true }
+  const resolveDestDir = async () => {
+    if (!destDirHandle) return null;
+    if (!await ensureDirPermission(destDirHandle)) return null;
+    let dir = destDirHandle;
+    for (const seg of subfolderSegments()) {
+      if (!seg) continue;
+      try { dir = await dir.getDirectoryHandle(seg, { create: true }); }
+      catch (e) { log.error(`subfolder "${seg}": ${e.message}`); return destDirHandle; }
+    }
+    return dir;
+  };
+
   const applyNaming = (originalName) => {
     const dot = originalName.lastIndexOf(".");
     const base = dot > 0 ? originalName.slice(0, dot) : originalName;
@@ -541,13 +589,15 @@
       task.fileName = applyNaming(task.fileName);
       renderTask(task);
       if (writable) await writable.close();
-      else if (destDirHandle && await ensureDirPermission(destDirHandle)) {
-        // stream into user-picked folder — no save-file dialog, no browser Downloads folder
-        const fh = await destDirHandle.getFileHandle(task.fileName, { create: true });
-        const w = await fh.createWritable();
-        await w.write(new Blob(parts, { type: mime }));
-        await w.close();
-      } else await saveMediaBlob(new Blob(parts, { type: mime }), task.fileName);
+      else {
+        const targetDir = await resolveDestDir();
+        if (targetDir) {
+          const fh = await targetDir.getFileHandle(task.fileName, { create: true });
+          const w = await fh.createWritable();
+          await w.write(new Blob(parts, { type: mime }));
+          await w.close();
+        } else await saveMediaBlob(new Blob(parts, { type: mime }), task.fileName);
+      }
       finishTask(task, writable ? "completed" : "handedOff");
     } catch (error) {
       if (writable) { try { await writable.abort(); } catch {} }
@@ -1373,6 +1423,16 @@
             <button type="button" class="sakerly-settings-cleardir"></button>
           </div>
         </label>
+        <label class="sakerly-field">
+          <span class="sakerly-field-label" data-key="subfolder"></span>
+          <select class="sakerly-settings-subfolder">
+            <option value="none" data-key="subfolderNone"></option>
+            <option value="date" data-key="subfolderDate"></option>
+            <option value="channel" data-key="subfolderChannel"></option>
+            <option value="date_channel" data-key="subfolderDateChannel"></option>
+            <option value="channel_date" data-key="subfolderChannelDate"></option>
+          </select>
+        </label>
       </div>
     </div>
   `;
@@ -1387,12 +1447,15 @@
   const settingsFolderName = settingsModal.querySelector(".sakerly-folder-name");
   const settingsResetSeq = settingsModal.querySelector(".sakerly-settings-resetseq");
   const settingsSeqInfo = settingsModal.querySelector(".sakerly-seq-info");
+  const settingsSubfolder = settingsModal.querySelector(".sakerly-settings-subfolder");
 
   const refreshSettingsUI = () => {
     settingsModal.querySelector(".sakerly-settings-title").textContent = t("settingsTitle");
     settingsCloseBtn.title = t("close");
     settingsModal.querySelectorAll("[data-key]").forEach((el) => { el.textContent = t(el.dataset.key); });
     settingsNaming.value = settings.naming;
+    settingsSubfolder.value = settings.subfolder || "none";
+    settingsSubfolder.disabled = !destDirName;
     settingsPrefix.value = settings.prefix || "";
     settingsPrefix.placeholder = t("prefixPlaceholder");
     settingsFolderName.textContent = destDirName || t("folderNone");
@@ -1418,6 +1481,7 @@
   settingsCloseBtn.onclick = () => { settingsModal.hidden = true; };
   settingsModal.querySelector(".sakerly-modal-backdrop").onclick = () => { settingsModal.hidden = true; };
   settingsNaming.onchange = () => { settings.naming = settingsNaming.value; saveStore("settings", settings); refreshSettingsUI(); };
+  settingsSubfolder.onchange = () => { settings.subfolder = settingsSubfolder.value; saveStore("settings", settings); refreshSettingsUI(); };
   settingsPrefix.oninput = () => { settings.prefix = settingsPrefix.value; saveStore("settings", settings); };
   settingsResetSeq.onclick = () => { seqCounter = 1; saveStore("seq", 1); refreshSettingsUI(); };
   settingsPickDir.onclick = async () => {
