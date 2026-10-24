@@ -22,6 +22,9 @@
 (function () {
   "use strict";
 
+  // read from the userscript header via the manager so @version stays the single source of truth
+  const SCRIPT_VERSION = (typeof GM_info !== "undefined" && GM_info?.script?.version) || "1.0";
+
   // ===== i18n (VI default, EN fallback) =====================================
   const LANGS = {
     vi: {
@@ -1326,6 +1329,18 @@
       text-shadow: 0 1px 2px rgba(0,0,0,.35);
       border: 1px solid rgba(255,255,255,.15);
     }
+    #sakerly-panel .sakerly-panel-foot,
+    #sakerly-select-bar .sakerly-select-foot { justify-content: space-between; }
+    #sakerly-select-bar .sakerly-select-foot {
+      display: flex; align-items: center;
+      padding: 8px 14px; border-top: 1px solid var(--sk-line);
+      font-size: 11px; font-weight: 600; color: var(--sk-muted);
+      background: var(--sk-bg-head);
+    }
+    .sakerly-version {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-weight: 500; opacity: .85;
+    }
     #sakerly-select-bar .sakerly-dl-primary {
       margin: 10px 14px 14px; padding: 11px;
       background: var(--sk-accent); color: var(--sk-accent-fg);
@@ -1459,6 +1474,7 @@
     <div class="sakerly-task-list"></div>
     <div class="sakerly-panel-foot">
       <span>SakerLy</span>
+      <span class="sakerly-version">v${SCRIPT_VERSION}</span>
     </div>
   `;
   document.body.appendChild(panel);
@@ -1655,6 +1671,10 @@
         <button type="button" id="sk-clear-btn"></button>
       </div>
       <button type="button" id="sk-dl-btn" class="sakerly-dl-primary"></button>
+      <div class="sakerly-select-foot">
+        <span>SakerLy</span>
+        <span class="sakerly-version">v${SCRIPT_VERSION}</span>
+      </div>
     </div>
   `;
   document.body.appendChild(selectBar);
@@ -1858,18 +1878,20 @@
   const refreshWebK = () => {
     refreshWebKGlyph();
 
-    // auto-queue video when viewer resolves to a new URL, then auto-advance to next in album
+    // auto-queue: videos only (photos go through batch select). when the viewer lands on a new item,
+    // queue it if it's a video, then auto-advance — photo slides are passed over without downloading
+    // so a mixed album keeps walking to its videos.
     if (autoQueueMode) {
       const r = resolveViewerWebKMedia();
       const mk = r && mediaKey(r.url);
       if (r && !seenAutoQueueUrls.has(mk)) {
         seenAutoQueueUrls.add(mk);
-        queuedViewerUrls.add(mk);
-        // still advance past media saved on an earlier visit, just don't fetch it again
-        if (downloadedKeys.has(mk)) log.info(`auto-queue: skip ${r.kind}, already downloaded`);
+        if (r.kind !== "video") log.info("auto-queue: photo slide, skipped");
+        else if (downloadedKeys.has(mk)) log.info("auto-queue: skip video, already downloaded");
         else {
+          queuedViewerUrls.add(mk);
           downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
-          log.info(`auto-queue: ${r.kind}`);
+          log.info("auto-queue: video");
         }
         setTimeout(autoAdvanceViewer, 400);
       }
@@ -2062,5 +2084,5 @@
     refreshApp();
   }
 
-  log.info(`SakerLy Telegram Media Downloader v1.0 loaded (${currentLang.toUpperCase()})`);
+  log.info(`SakerLy Telegram Media Downloader v${SCRIPT_VERSION} loaded (${currentLang.toUpperCase()})`);
 })();

@@ -204,15 +204,7 @@ Tampermonkey checks for updates every 24h by default via `@updateURL` / `@downlo
 
 ## Changelog
 
-### 1.0
-- Dual-panel UI: Downloads (bottom-right) + Batch select (top-right), draggable & collapsible
-- Range-fetch engine (HTTP 206, 4 MB chunks, 2 concurrent, 30 s timeout, retry/cancel per task)
-- Batch photo select with Shift+Click range support
-- Auto-queue mode for videos (resolves on viewer open, auto-advances to next slide in album)
-- Queue button on viewer topbar + download button on video controls
-- VI / EN language toggle in Settings, persisted via localStorage
-- Settings: file naming formats, prefix, sequence counter, destination folder, auto subfolders
-- Auto-update via `@updateURL` / `@downloadURL`
+Xem / See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
