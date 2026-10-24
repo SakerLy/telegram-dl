@@ -1598,16 +1598,52 @@
     updateSelectBar();
   };
   selClearBtn.onclick = clearSelection;
+  // tweb keeps off-screen bubbles mounted (virtual scroll) — relying on the bubble's rect alone catches
+  // the cached ones too. Instead walk every real post-image element in the document, filter by the IMAGE's
+  // own geometry inside the viewport, then group what survives back to its bubble.
+  const isElementVisibleInViewport = (el) => {
+    if (!el || !el.offsetParent) return false;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+    const r = el.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const visY = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    const visX = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+    return visY >= 40 && visX >= 40;
+  };
   selAllBtn.onclick = () => {
-    // reset previous ticks so items scrolled off-screen in a prior load don't get carried over
     clearSelection();
-    const vh = window.innerHeight;
-    for (const b of allBubbles()) {
-      // require the bubble to be meaningfully on-screen (at least 40 px visible), not just overlapping by a pixel
-      const r = b.getBoundingClientRect();
-      const visible = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
-      if (visible >= 40) markSelected(b, true);
+    const imgs = Array.from(document.querySelectorAll(
+      ".bubble .attachment img.media-photo, .bubble .attachment img.thumbnail, .Message__media-item img"
+    )).filter((img) =>
+      img.naturalWidth > 200 &&
+      !img.closest(EXCLUDED_SCOPES) &&
+      !img.closest(EXCLUDED_BUBBLE_CLASSES) &&
+      isElementVisibleInViewport(img)
+    );
+    const byBubble = new Map();
+    for (const img of imgs) {
+      const bubble = img.closest(".bubble, .Message");
+      if (!bubble) continue;
+      if (!byBubble.has(bubble)) byBubble.set(bubble, []);
+      byBubble.get(bubble).push(img);
     }
+    for (const [bubble, bubbleImgs] of byBubble) {
+      const items = [];
+      const seen = new Set();
+      for (const img of bubbleImgs) {
+        const url = getMediaSource(img);
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        items.push({ url, kind: "image", el: img });
+      }
+      if (!items.length) continue;
+      bubble.classList.add("sakerly-sel");
+      selectedBubbles.add(bubble);
+      selectedItems.set(bubble, items);
+      items.forEach(paintTick);
+    }
+    updateSelectBar();
   };
   selDlBtn.onclick = () => {
     const items = [...selectedItems.values()].flat();
