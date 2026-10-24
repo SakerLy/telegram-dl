@@ -47,10 +47,10 @@ Mở ảnh/video trong viewer → bấm **⤓** ở topbar.
 #### Tải hàng loạt video (noforwards channel)
 Video chỉ load src khi mở viewer. Dùng **Auto-queue**:
 1. Bấm **Auto-queue video** (nền xanh = bật)
-2. Mở video đầu tiên bằng tay
-3. Script tự thêm vào hàng chờ + tự chuyển slide tiếp theo trong album
-4. Dùng mũi tên trái/phải (hoặc nút chuyển TG) để qua post khác, mỗi video mới tự enqueue
-5. Tắt Auto-queue khi xong
+2. Click vào media đầu tiên của post để mở viewer. Lúc click, script đếm sẵn post có bao nhiêu video.
+3. Script tự thêm từng video vào hàng chờ và tự chuyển slide. Ảnh trong post được bỏ qua, không tải.
+4. Khi đã gặp đủ số video của post, hoặc tới item cuối của post, script dừng lại và nút tải hiện "Xong post: N video". Nó không chạy sang post khác.
+5. Muốn tải post khác: đóng viewer và click vào post đó.
 
 ### 4. Phím tắt
 
@@ -148,10 +148,10 @@ Open the media in viewer → click **⤓** on the topbar.
 #### Batch videos (noforwards channels)
 Videos only have a src once the viewer is opened. Use **Auto-queue**:
 1. Toggle **Auto-queue video**
-2. Open the first video manually
-3. Script enqueues + auto-advances to the next slide in the album
-4. Use ← → to move between posts; each new video is auto-queued
-5. Toggle Auto-queue off when done
+2. Click the first media of a post to open the viewer. On that click the script counts the post's videos.
+3. Each video is queued and the viewer auto-advances. Photos in the post are skipped, not downloaded.
+4. Once every video of the post was seen, or the post's last item is reached, it stops and the download button shows "Post done: N video(s)". It never runs on into other posts.
+5. For another post: close the viewer and click that post.
 
 ### 4. Shortcuts
 

@@ -74,6 +74,7 @@
       close: "Đóng",
       clearHistory: "Xoá lịch sử",
       skippedDownloaded: "Bỏ qua {n} mục đã tải trước đó",
+      postVideosDone: "Xong post: {n} video",
       downloadedCount: "Đã nhớ {n} media đã tải (không tải lại)",
       forgetDownloaded: "Quên hết",
       subfolder: "Thư mục con tự động",
@@ -130,6 +131,7 @@
       close: "Close",
       clearHistory: "Clear history",
       skippedDownloaded: "Skipped {n} already downloaded",
+      postVideosDone: "Post done: {n} video(s)",
       downloadedCount: "Remembering {n} downloaded media (won't re-download)",
       forgetDownloaded: "Forget all",
       subfolder: "Auto subfolder",
@@ -853,7 +855,8 @@
   // avatars (.bubbles-group-avatar/.user-avatar/.bubble-name-forwarded-avatar), stickers (.bubble.sticker),
   // video-round (.bubble.round), emoji-big, service bubbles — never selects.
   // webz fallback: `.Message__media-item`.
-  const ATTACHMENT_CONTAINER = ".bubble .attachment, .Message__media-item";
+  // `.bubble__media-container` replaces `.attachment` on bubbles with a media tail (bubbles.ts viewer targets)
+  const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message__media-item";
   const EXCLUDED_SCOPES = ".reply, .reply-content, .reply-summary, .reply-wrapper, .reply-media, .webpage, .webpage-preview, .webpage-with-thumb, .webpage-thumb, .bubbles-group-avatar, .bubbles-group-avatar-container, .user-avatar, .bubble-name-forwarded-avatar, avatar-element, .avatar, .service-msg, .bubble-service-media, .sticker-wrapper, [class*='Sticker'], .custom-emoji, [class*='CustomEmoji'], .emoji, .reactions, .reactions-like-block, .reaction, [class*='Reaction'], .peer-title, .bubble-name-chip-container, [class*='Avatar']";
   const EXCLUDED_BUBBLE_CLASSES = ".bubble.service, .bubble.has-fake-service, .bubble.sticker, .bubble.round, .bubble.emoji-big, .bubble.is-invoice";
   const isRealAttachment = (el) => {
@@ -890,7 +893,7 @@
   //     and any video-time badge rule out the scope)
   //   - the scope has no .video-time / .ckin__player / play-icon marker (unopened video thumbnail)
   //   - the scope is NOT inside .reply, .webpage, avatar, sticker, reaction, etc.
-  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .Message__media-item";
+  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .bubble .bubble__media-container, .Message__media-item";
   const PHOTO_IMG_SELECTOR = "img.media-photo";
   // tweb wrappers/video.ts: posters are drawn by wrapPhoto and get `media-photo` too, so the img class alone
   // can't tell photo from video. these markers are only ever added for video/gif/round media.
@@ -1807,6 +1810,36 @@
     if (skipped) flashDlButton(t("skippedDownloaded", { n: skipped }));
   };
 
+  // auto-queue post plan. tweb (chat/bubbles.ts) opens the viewer with the clicked bubble's media items
+  // in DOM order — `.album-item`, else `.bubble__media-container` / `.attachment` — and "next" walks them
+  // in that order before leaving the post. so at click time we already know how many videos lie ahead.
+  let armedPost = null;
+  const POST_ITEM_SELECTOR = ".album-item, .bubble__media-container, .attachment";
+  const postMediaItems = (bubble) => {
+    const albumItems = bubble.querySelectorAll(".album-item");
+    const items = albumItems.length ? Array.from(albumItems) : Array.from(bubble.querySelectorAll(".bubble__media-container, .attachment")).slice(0, 1);
+    return items.filter((el) => !el.closest(EXCLUDED_SCOPES));
+  };
+  document.addEventListener("click", (e) => {
+    if (!autoQueueMode || selectMode) return;
+    const item = e.target.closest?.(POST_ITEM_SELECTOR);
+    const bubble = item?.closest(".bubble");
+    if (!item || !bubble || item.closest(EXCLUDED_SCOPES)) return;
+    const items = postMediaItems(bubble);
+    const startIdx = Math.max(0, items.findIndex((el) => el === item || el.contains(item) || item.contains(el)));
+    const ahead = items.slice(startIdx);
+    armedPost = {
+      total: items.length,
+      startIdx,
+      videoCount: ahead.filter(scopeIsVideoLike).length,
+      videosSeen: 0,
+      step: 0,
+      armedAt: Date.now(),
+    };
+    seenAutoQueueUrls.clear(); // reopening the same post must walk it again
+    log.info(`auto-queue: post has ${armedPost.videoCount} video(s) from the clicked item on`);
+  }, true);
+
   // click handler for select mode. we intercept any click inside a bubble that has at least one
   // real photo scope — the strict picker is applied inside markSelected, so a click on a video post
   // short-circuits with a log line rather than silently doing nothing.
@@ -1878,22 +1911,40 @@
   const refreshWebK = () => {
     refreshWebKGlyph();
 
-    // auto-queue: videos only (photos go through batch select). when the viewer lands on a new item,
-    // queue it if it's a video, then auto-advance — photo slides are passed over without downloading
-    // so a mixed album keeps walking to its videos.
+    // viewer closed → the post walk is over
+    if (armedPost && armedPost.step > 0 && !document.querySelector(".media-viewer-whole")) armedPost = null;
+
+    // auto-queue: videos only. the walk is scoped to the post the user clicked (see armPostFromClick):
+    // queue each video slide, pass over photo slides, and stop once every video of that post was seen
+    // or the post's last item is reached — tweb's "next" would otherwise run through the whole chat.
     if (autoQueueMode) {
       const r = resolveViewerWebKMedia();
       const mk = r && mediaKey(r.url);
       if (r && !seenAutoQueueUrls.has(mk)) {
         seenAutoQueueUrls.add(mk);
+        // a click older than a few seconds didn't open this viewer — don't apply its post plan
+        if (armedPost && armedPost.step === 0 && Date.now() - armedPost.armedAt > 5000) armedPost = null;
+        const post = armedPost;
+        if (post) post.step++;
         if (r.kind !== "video") log.info("auto-queue: photo slide, skipped");
-        else if (downloadedKeys.has(mk)) log.info("auto-queue: skip video, already downloaded");
         else {
-          queuedViewerUrls.add(mk);
-          downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
-          log.info("auto-queue: video");
+          if (post) post.videosSeen++;
+          if (downloadedKeys.has(mk)) log.info("auto-queue: skip video, already downloaded");
+          else {
+            queuedViewerUrls.add(mk);
+            downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
+            log.info("auto-queue: video");
+          }
         }
-        setTimeout(autoAdvanceViewer, 400);
+        if (post) {
+          const lastSlideOfPost = post.startIdx + post.step >= post.total;
+          if (post.videosSeen >= post.videoCount || lastSlideOfPost) {
+            log.info(`auto-queue: post done, ${post.videosSeen}/${post.videoCount} videos`);
+            flashDlButton(t("postVideosDone", { n: post.videosSeen }));
+            armedPost = null;
+          } else setTimeout(autoAdvanceViewer, 400);
+        }
+        // no armed post (viewer opened some other way): queue this one item, never walk the chat
       }
     }
 
