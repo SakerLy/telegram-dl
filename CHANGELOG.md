@@ -1,141 +1,81 @@
 # Changelog
 
-## 2.2.0 — Sửa 6 lỗi báo cáo + 2 lỗi engine tìm thấy khi test kỹ, đối chiếu DOM tweb/telegram-tt mới nhất
+Mọi thay đổi đáng chú ý của Telegram Media Downloader được ghi lại ở đây.
+Định dạng theo [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/), phiên bản theo [Semantic Versioning](https://semver.org/lang/vi/).
 
-Toàn bộ selector và luồng viewer được đối chiếu lại với source hiện tại của **tweb** (WebK) và **telegram-tt** (WebA) trước khi sửa — nhiều giả định của v2.1 đã lỗi thời.
+## 2.2.1
 
-### 1. "Chọn tất cả hiển thị" tải nhầm mục (ảnh bị che / sticker / ảnh bản đồ / quảng cáo)
-- **Visibility chặt lại**: cũ chỉ cần 40×40px giao với *cửa sổ trình duyệt* — ảnh nằm sau composer, sau topbar hay mới ló vài chục px ở mép vẫn bị chọn rồi tải. Giờ "hiển thị" = **≥50% diện tích ảnh nằm trong vùng nhìn thấy thật của khung chat** (`.bubbles-viewport` của WebK / `.MessageList` của WebA), ảnh phải có kích thước thật.
-- **WebA — sticker bị tải như ảnh** (telegram-tt StickerView.tsx): sticker tĩnh render `<img class="full-media sticker-media">` trong `.media-inner` → giờ bị loại qua `.sticker-media`.
-- **WebA — ảnh bản đồ bị tải** (Location.tsx): `.Location.media-inner` chứa `img.full-media.map` → loại qua `.Location`, `.map`, `.venue-icon`.
-- **WebA — tin quảng cáo** có `.SponsoredMessage.Message` (vẫn là `.Message`!) → loại qua `.SponsoredMessage`, `.sponsored-media-preview`; WebK qua `.bubble.sponsored`.
-- Loại thêm lưới sticker của trang web (`.WebPage--sticker`, `.webpage-stickerset-grid`). Thumb reply/quote vốn đã an toàn ở cả 2 client (`.reply-media` không khớp scope; `.EmbeddedMessage` đã exclude).
+### Thay đổi
+- **Auto-queue biết trước còn bao nhiêu video.** Ngay khi bạn click vào một media, script đếm số video phía trước trong khung chat và dừng ngay sau video cuối cùng, không còn đi tiếp qua các slide chỉ có ảnh.
+- **Danh sách mục đã chọn dạng lưới ảnh thu nhỏ**, có số thứ tự; click vào một ô để cuộn tới ảnh đó trong chat.
+- **Cài đặt thiết kế lại**: chia 4 nhóm (Chung, Tên file, Nơi lưu, Dữ liệu) và có dòng xem trước tên file theo định dạng đang chọn.
 
-### 2. Nút "Xoá danh sách tải" không có icon
-- Nút `.sk-clear` vốn **rỗng** (không có icon nào). Giờ có icon thùng rác SVG đồng bộ style với bánh răng.
+### Sửa lỗi
+- Auto-queue dừng giữa chừng dù phía trước vẫn còn video (sau nhiều slide ảnh liên tiếp, khi trình xem bỏ qua lệnh chuyển slide, hoặc khi cùng một file xuất hiện hai lần).
+- Chữ và icon của nút "Tải mục đã chọn" bị tím trên WebK, do trùng tên class với Telegram.
+- Danh sách mục đã chọn đẩy các nút xuống mỗi khi dài thêm.
 
-### 3 + 6. Màu chữ nút chìm, khó đọc (đặc biệt theme tối)
-- Theme tối cũ dùng **chữ đen trên nền xanh sáng** (`--sk-accent-fg:#06111c` trên `#4aa5ff`, `--sk-ok-fg:#052012` trên `#10b981`) — về mặt kỹ thuật đủ tương phản nhưng nhìn "tối và chìm". Giờ **chữ trắng trên nền đậm**: `#1a72bd`/`#0b7c56`, mọi cặp chữ-nền ≥ 4.5:1 WCAG ở cả 2 theme (kiểm chứng bằng script đo tương phản).
-- Đổi mới toàn bộ: chip đếm (`#9fd1ff` trên `#1c3a5c`), nút danger (`#d92d20` light / `#ff6b6b` dark), focus ring, thanh progress tách màu nền nút (`--sk-accent-bar`) khỏi màu nút để nền nút đậm mà thanh vẫn sáng.
-- Thanh `✓` chọn ảnh: nền xanh đậm + dấu trắng.
+## 2.2.0
 
-### 4. Auto-queue không tự chuyển video (WebK)
-Ba nguyên nhân chồng nhau, đều đã xử lý:
-- **Resolver đọc nhầm slide cũ**: tweb giờ bọc mỗi slide trong `.media-viewer-mover-wrapper` riêng và **append wrapper mới sau wrapper cũ** khi chuyển slide — `querySelector` lấy aspecter *đầu tiên* sẽ đọc đúng slide đang bay ra khỏi màn hình. Giờ đọc mover **`center active`** (trạng thái nghỉ), fallback wrapper cuối cùng.
-- **`armedPost` hết hạn 5 giây**: video lớn load chậm hơn 5s → post bị bỏ, sau đó `if (!post) return` khiến viewer **đứng im sau khi xếp hàng video đầu tiên**. Giờ auto-advance **không phụ thuộc armedPost**: luôn tự chuyển khi Auto-queue bật, dừng khi hết slide hoặc 10 slide liên tiếp không có video mới; armedPost chỉ còn phục vụ thông báo "Xong post: N video".
-- **WebA bấm nút chết**: `button.navigation.next` trong telegram-tt **không có click handler** (chỉ là nút trang trí; đổi slide thật qua `keydown` ArrowRight trên document). v2.1 click nút này rồi return → không bao giờ chuyển. Giờ dispatch ArrowRight trực tiếp, dừng sớm khi nút bị `hide` (hết slide).
+### Sửa lỗi
+- **Chọn tất cả hiển thị** chỉ chọn ảnh thật sự nhìn thấy trong khung chat; không còn chọn ảnh khuất sau ô nhập tin, sticker, ảnh bản đồ hay tin quảng cáo (WebA).
+- **Auto-queue** đọc đúng slide đang xem trên WebK, không còn đứng im khi video tải chậm; trên WebA chuyển slide bằng phím → như client gốc.
+- **Tạm dừng → Tiếp tục** hoạt động với mọi task: không còn lỗi khi tải qua bộ nhớ (Firefox) và không còn treo sau khi tạm dừng.
+- **Panel Tải xuống** không tự bung ra sau khi bạn đã thu gọn; danh sách cuộn bên trong panel.
+- **Màu nút** dễ đọc ở cả hai theme (độ tương phản tối thiểu 4.5:1).
+- Nút xoá danh sách tải có icon thùng rác.
 
-### 5. Panel lịch sử bị đẩy / kéo dài ra khi bấm sau khi tải xong
-- **Không còn tự bung panel**: v2.1 mỗi task card mới đều `remove("collapsed")` — user thu gọn rồi nó cứ bung ra liên tục (đặc biệt với auto-queue). Giờ ghi nhớ ý muốn thu gọn của user; task mới chỉ xuất hiện card, panel giữ nguyên.
-- **Chiều cao card ổn định**: hàng nút (Tạm dừng / Hủy / Thử lại) giữ slot cố định — ẩn/hiện nút theo state không còn làm card giật giật kéo panel theo.
-- **Flexbox chuẩn**: `.sk-task-list` / `.sk-select-body` có `flex:1 1 auto; min-height:0` — danh sách tự cuộn bên trong panel `max-height` thay vì đẩy panel dài ra; panel Downloads giới hạn `min(100vh-32px, 620px)`.
-- **Cuộn đúng chỗ**: `scrollIntoView` (cuộn được cả trang) thay bằng cuộn riêng trong `.sk-task-list`.
+## 2.1.0
 
-### Hai lỗi engine tìm thấy khi test (có trong cả v2.0–v2.1)
-- **Pause → Resume luôn fail với task ghi qua bộ nhớ** (Firefox / không có File System Access): `MemWriter` thiếu method `open()` → `this.inner.open is not a function`. Đã thêm no-op.
-- **Claim ma sau pause = resume treo vĩnh viễn**: khi pause hủy request giữa chừng, đường thoát "bình thường" (cancel → đọc hết → complete → nhận partial claim) ném lỗi ở đầu vòng lặp mà **không trả claim về ledger** → hole bị đánh dấu "đang giữ" mãi → Resume chỉ xoay vòng poll, không fetch tiếp (đến 120s watchdog mới giết task). Giờ mọi lối thoát lỗi của worker đều `ledger.release(claim)` tập trung ở `catch` ngoài. Kiểm chứng: resume fetch đúng range thiếu, không tải lại từ đầu.
+### Thêm
+- Panel hiển thị và bấm được ngay trên trình xem media của WebA.
+- Panel Tải xuống luôn hiển thị, có trạng thái "Chưa có tải xuống nào".
+- Nút gạt cho Chế độ chọn và Auto-queue; nút tải chính có icon và nổi bật hơn.
 
-### Kiểm thử
-- 18 bài test engine headless (Node): RangeLedger, song song, response bị kẹp ngắn, mime sai fatal, HTTP 500 retry, pause, cancel, blob fast-path, retry hết lượt, NetBudget, i18n — 18/18 pass.
-- 5 lần chạy bài tái hiện pause→resume: không claim ma, hoàn tất đúng phần thiếu.
-- Script đo tương phản WCAG: 26/26 cặp màu ≥ 4.5:1 (2 theme).
-- UI test trên Chromium thật với 2 trang mock DOM dựng theo đúng source tweb/telegram-tt (album, sticker, Location, reply, sponsored, viewer đa mover, dialog top-layer): chọn tất cả đúng tập ảnh hiển thị; loại sticker/map/reply-thumb/quảng cáo; auto-queue WebK chuyển đủ slide & dừng đúng; auto-queue WebA chạy bằng ArrowRight (không đụng nút chết); panel giữ trạng thái thu gọn; đổi ngôn ngữ VI/EN; phím tắt; panel vẫn click được trong dialog WebA.
+### Sửa lỗi
+- Ảnh trong album không còn bị gộp thành một mục khi chọn.
+- Cùng một file được xếp hàng từ hai nơi (trình xem và chat) chỉ tạo một task.
+- Nút "Xoá lịch sử" xoá được mọi task, trừ task đang tải.
+- Auto-queue hoạt động trên WebA.
 
-## 2.1.0 — Panel trên viewer WebA (top-layer), UI mới, auto-queue thông minh, chống trùng lặp
+## 2.0.2
 
-### Panel "biến mất" trên view video (WebA) — sửa tận gốc
-- **Nguyên nhân thật** (khác mọi chẩn đoán trước): WebA render media viewer là **`<dialog id="MediaViewer">` mở bằng `showModal()`** (MediaViewer.tsx:633 + useLayoutEffect `dialog.showModal()`). Dialog nằm trong **top layer** của browser — vẽ **trên mọi z-index** (kể cả 2147483646) và khiến toàn bộ phần còn lại của trang **inert** (không click được). Đó là lý do panel "bị ẩn" và không thao tác được khi mở video trên WebA, đã kiểm chứng trên cả source (clone f67a408) lẫn bundle deploy thật (`showModal` + `MediaViewerSlide--active` trong `extra-*.js`, CSS `#MediaViewer{position:fixed;top:0;left:0;width:100vw;height:100%;border:0;margin:0;padding:0}` — không transform khi đã mở).
-- **Fix**: `keepPanelsOnTop()` — khi viewer WebA mở, chuyển `#sk-panel`, `#sk-select`, `#sk-settings` **vào bên trong dialog đang mở** (renders cùng top layer, click được); đóng viewer thì trả về `document.body`. Panel là `position:fixed` nên không ảnh hưởng grid layout của dialog. MutationObserver giờ cũng theo dõi `removedNodes` để kéo panel về body ngay khi dialog bị gỡ.
-- **Panel Downloads luôn hiển thị** (bỏ logic ẩn khi rỗng): khi chưa có task hiện dòng mờ "Chưa có tải xuống nào" — panel luôn nhìn thấy được trên viewer.
+### Sửa lỗi
+- WebA: mở video trong trình xem không tải được bằng Auto-queue.
 
-### UI nút mới — rõ ràng hơn
-- Hệ nút thiết kế lại: cao 34–42px, font đậm 12–13px, bo góc 10px, hover/active/focus-visible rõ ràng.
-- **Toggle chip** cho "Chế độ chọn" / "Auto-queue video": chấm trằng trạng thái + nền xanh khi BẬT (không còn chữ "✓" lẫn vào text, không còn nút "danger" gây hiểu lầm).
-- Nút tải chính: nền xanh + icon tải + shadow — nổi bật hẳn so với nút phụ.
-- Nút task card (Tạm dừng / Hủy / Thử lại) đồng bộ стиль, Hủy đỏ rõ ràng.
+### Thêm
+- Nút "Thêm vào hàng chờ" trong trình xem media của WebA.
 
-### "Chọn tất cả hiển thị" — sửa 3 lỗi
-- **Đẩy scroll panel**: danh sách mục đã chọn giờ **cao tối đa 150px + scrollbar riêng** (không còn tràn đẩy nội dung), và `updateSelectBar` **giữ nguyên scrollTop** của panel khi vẽ lại.
-- **Tải mục không nhìn thấy**: visibility check giờ chạy trên **đúng ảnh sẽ được tải** (`item.el` — ảnh lớn nhất trong scope) thay vì ảnh đầu tiên query được.
-- **Ảnh album bị gộp/mất**: key chọn ảnh giờ thêm hash URL (`msg:peer:mid.<urlhash>`) — mỗi ảnh trong album là một mục riêng, không bị gộp còn 1 như trước (WebK) và không trùng lặp khi chọn lại.
+## 2.0.1
 
-### Chống tải trùng lặp file
-- `downloadMedia` dedupe **thêm theo URL**: cùng nguồn được xếp hàng qua 2 đường khác nhau (viewer vs batch select) trả về đúng 1 task đang chạy thay vì tạo bản sao.
-- Task evict (quá 30 mục) giờ **xóa cả card** — hết card "mồ côi" mà nút Xoá lịch sử không với tới.
+### Sửa lỗi
+- Hộp thoại Cài đặt hiện sẵn khi tải trang, không có nhãn và không đóng được.
+- Nút "Tải mục đã chọn" khi chưa chọn gì khó đọc.
 
-### Auto-queue: tự chuyển video + phát hiện video trong post/reply (WebA hoạt động đầy đủ)
-- **WebA trước đây không tự chuyển được**: `postMediaItems`/`armPostFromClick` chỉ biết selector WebK (`.bubble`, `.attachment`), và `autoAdvanceViewer` chỉ click `.media-viewer-switcher-next` của WebK. Giờ:
-  - Nhận media item của cả WebA (`.Message`, `.media-inner`, `.album-item`) — mở video đơn hay album đều arm đúng post.
-  - `autoAdvanceViewer` WebA: click `#MediaViewer .navigation.next` (nút next thật của viewer), fallback synthetic `ArrowRight` (WebA gắn keydown trên document — MediaViewerSlides.tsx:644).
-  - `viewerOpen()` đúng theo client (`#MediaViewer` vs `.media-viewer-whole` — WebK gỡ khỏi body khi đóng, đã xác minh base.ts:1056).
-- **Săn video tiếp post/reply**: hết slide của post hiện tại không dừng ngay — tiếp tục tự chuyển qua các slide kế tiếp (post/reply liền kề) và xếp hàng mọi video mới tìm thấy; dừng khi hết slide hoặc **10 slide liên tiếp không có video mới** (`AUTO_QUEUE_HUNT_SLIDES`). Flash "Xong post: N video" giữ nguyên.
+## 2.0.0
 
-### Nút "Xoá lịch sử tải" clear hết
-- Trước đây chỉ bỏ task `finished` đang trong `downloadTasks` → sót card mồ côi + task paused/queued không bao giờ biến mất. Giờ: quét **toàn bộ card trong DOM**, task queued/paused/failed/cancelled bị hủy rồi bỏ card, card mồ côi bị xóa thẳng; chỉ giữ task đang thực sự tải (downloading/preparing/saving).
+Engine tải được viết lại, dựa trên cách hai client Web chính thức của Telegram ([tweb](https://github.com/morethanwords/tweb) và [telegram-tt](https://github.com/Ajaxy/telegram-tt)) tải file.
 
-### Dọn code
-- Bỏ các comment song ngữ dài dòng và ghi chú "BUGFIX" lịch sử — giữ comment ngắn gọn tiếng Việt cho các chỗ logic khó.
+### Thêm
+- Tải song song 1–4 luồng mỗi file (mặc định 3), chỉnh trong Cài đặt.
+- Tự thử lại từng phần tới 5 lần; tự giảm kích thước phần khi mạng chậm.
+- Tiếp tục từ chỗ dừng sau lỗi; Tạm dừng / Tiếp tục.
+- Tốc độ thực và thời gian còn lại trên mỗi task.
+- Firefox: file trên 1,2 GB ở WebA được chuyển cho trình tải gốc của Telegram, ghi thẳng xuống đĩa.
 
-## 2.0.2 — Sửa lỗi WebA: auto-queue/không tải được video khi mở viewer
-
-- **Triệu chứng**: trên web.telegram.org/a, khi mở video trong viewer: không có gì xảy ra — panel Downloads "bị ẩn" mãi (không task nào được tạo) và video không tải được bằng Auto-queue.
-  - Nguyên nhân gốc: toàn bộ luồng auto-queue + nút hàng đợi trong viewer chỉ được viết cho WebK (`processAutoQueue` gọi `resolveViewerWebKMedia` với selector `.media-viewer-whole` — không tồn tại trên WebA; `refreshWebA` không bao giờ gọi `processAutoQueue`, cũng không có nút queue).
-- **Fix**:
-  - `resolveViewerWebAMedia()` mới — đọc đúng **slide active** (`#MediaViewer .MediaViewerSlide--active`); chỉ slide active mới có `<video>` (slide khác chỉ là poster), slide video chưa có src trả `null` thay vì nhầm poster thành ảnh.
-  - `processAutoQueue()` giờ chọn resolver theo client (`isWebA` → WebA) và được gọi ở đầu `refreshWebA` → mở viewer trên WebA là video tự động xếp hàng như WebK, task card hiện → panel Downloads xuất hiện.
-  - `queueCurrentWebAMedia()` + nút hàng đợi (`Button smaller translucent-white round`) trong actions bar và player controls của WebA viewer — ngang hàng WebK.
-  - `downloadCurrentWebAMedia` dùng resolver chung; nếu chưa đọc được nguồn (video chưa phát) thì log cảnh báo rõ ràng thay vì thất bại im lặng.
-- Đối chiếu selector với source telegram-tt hiện tại: `#MediaViewer`, `.MediaViewerSlide--active`, `.MediaViewerActions`, `.VideoPlayer`, `.VideoPlayerControls .buttons`, `.spacer` — tất cả còn đúng ở bản deploy (đã kiểm chứng qua bundle web.telegram.org/a và repo clone 2026-10-16).
-- Test engine: tăng latency mô phỏng của bài đo song song (10→60ms) để loại flake `maxInFlight` — 43/43 ổn định × 4 lần chạy.
-
-## 2.0.1 — Sửa lỗi UI: modal Cài đặt dính trên màn hình (settings dialog stuck)
-
-- **Lỗi UI nghiêm trọng**: hộp thoại Cài đặt bị **hiển thị vĩnh viễn từ khi tải trang**, mọi trường trống (không nhãn, dropdown trắng, select luồng đứng ở "1", các select không có chữ), bấm × / Esc / click nền cũng không tắt được.
-  - Nguyên nhân: rule `#sk-settings { display:flex }` (specificity 1-0-0) override rule mặc định `[hidden] { display:none }` của trình duyệt; rule ẩn của script (`#sk-settings [hidden]`) chỉ khớp phần tử **con cháu**, bỏ sót chính root — nên `hidden` không còn tác dụng với modal.
-  - Fix: bổ sung `#sk-panel[hidden], #sk-select[hidden], #sk-settings[hidden] { display:none !important }` — modal ẩn đúng lúc khởi tạo, chỉ hiện khi bấm gear.
-- **Chống trạng thái trắng**: tách `translateSettingsUI()` khỏi `refreshSettingsUI()` và gọi ngay lúc dựng UI — nhãn/option/nút được dịch sẵn, modal không bao giờ trắng trơn kể cả khi đường mở gặp lỗi.
-- Nút "Tải mục đã chọn" khi disable: đổi từ nền xanh mờ 50% (tương phản kém) sang nền xám + chữ muted dễ đọc.
-
-## 2.0.0 — Parallel engine rewrite (nâng cấp lõi tải theo 2 client Web chính thức)
-
-Engine v1 (range-fetch tuần tự 4 MB, 1 luồng/file, 0 retry) được viết lại hoàn toàn dựa trên kiến trúc tải file của **Telegram WebK** (`morethanwords/tweb`) và **Telegram WebA** (`Ajaxy/telegram-tt`).
-
-### Engine mới — học từ client chính thức
-
-- **Tải song song thật**: N worker đồng thời mỗi file (mặc định 3 — bằng `MAX_CONCURRENT_CONNECTIONS` của WebA, chỉnh 1–4 trong Settings). Chunk 512 KB-aligned khớp grid nội bộ của SW WebK và clamp 512 KB/response của SW WebA; URL `stream/` (WebK) tự tăng lên 1 MB sau 4 chunk đầy (bằng `MAX_DOWNLOAD_FILE_PART_SIZE` của cả hai client).
-- **RangeLedger** (kiểu `FileView` của WebA): bản đồ interval byte — chunk về out-of-order, response bị SW kẹp ngắn không gây lỗi, resume chỉ tải đúng phần thiếu.
-- **Retry + backoff**: mỗi chunk retry tối đa 5 lần với backoff 250 ms × 2^n + jitter (pattern `getRetryTimeout` của mediaLoader WebA); stall timeout 60 s reset theo dữ liệu (pattern `SENDER_TIMEOUT`); timeout liên tiếp → tự thu nhỏ chunk 512→256 KB; task tự retry 1 lần sau 3 s khi lỗi mạng.
-- **NetBudget 12 MB in-flight** (pattern `dcBandwidthManager` của WebA) + watchdog 120 s chống treo.
-- **Resume trong phiên**: lỗi giữa chừng commit phần đã tải (FileSystemWritableFileStream + `keepExistingData`); nút **Retry** tiếp tục từ chunk chưa xong; **Pause/Resume** giữ nguyên tiến trình.
-- **BlobRegistry**: hook `URL.createObjectURL` giữ Blob gốc — blob: URL tải bằng `Blob.slice` trực tiếp, 0 network, Blob vẫn dùng được sau khi app revoke URL.
-- **Tốc độ thực + ETA**: SpeedMeter cửa sổ trượt 3 s (thay vì tốc độ trung bình cả phiên), progress throttle 50 ms (pattern tweb).
-- **WebA native fallback**: khi engine hết retry hoặc file > 1,2 GB mà trình duyệt không có File System Access (Firefox), tự chuyển sang endpoint `download/` của SW WebA — browser stream xuống disk trực tiếp, không tốn RAM.
-
-### Sửa lỗi thực tế
-
-- **Video WebA (web.telegram.org/a/) không tải được**: v1 yêu cầu range 4 MB + timeout 30 s + validation Content-Range quá cứng trong khi SW WebA trả tối đa 512 KB/response và cho part chờ tới 60 s → giờ chunk đúng grid, timeout đúng, response ngắn được ledger hấp thu.
-- **Chậm trên file lớn**: v1 chỉ 1 luồng/file — không tận dụng được queue 9×512 KB part song song của app; giờ N luồng × 2 task.
-- **Lỗi giữa chừng mất trắng**: giờ có retry per-chunk + auto task-retry + resume.
-
-### UI mới
-
-- Task card: % + thanh tiến trình, tốc độ thực, **ETA**, Pause/Resume, Retry-resume (hiển thị "Tiếp tục từ X%"), thông báo lỗi dịch sẵn.
-- Settings mới: **Số luồng tải mỗi file (1–4)**.
-- Giữ nguyên toàn bộ tính năng v1: batch select + tick + Shift-click, select-all-visible, auto-queue video, chống trùng, naming/prefix/subfolder, thư mục lưu (File System Access), stories, pinned audio, phím tắt, VI/EN.
-
-### Kỹ thuật
-
-- Ghi file qua `createWritable` + positioned writes (out-of-order an toàn), tự xóa file rỗng khi hủy task trong thư mục đích.
-- Dedupe key bền vững hơn: parse file id từ URL `stream/` (WebK) và `progressive/document…` (WebA).
-- 43 bài test headless (Node) cho engine: ledger, song song, retry, pause/resume, cancel, mime fatal, blob fast-path.
+### Sửa lỗi
+- Video trên WebA không tải được.
+- File lớn tải chậm vì chỉ dùng một luồng.
+- Lỗi giữa chừng buộc phải tải lại từ đầu.
 
 ## 1.0
 
-- Dual-panel UI: Downloads (bottom-right) + Batch select (top-right), draggable & collapsible
-- Range-fetch engine (HTTP 206, 4 MB chunks, 2 concurrent, 30 s timeout, retry/cancel per task)
-- Batch photo select: click, Shift+Click range, and additive "Select all visible" with a tick on each photo
-- Auto-queue for videos only: queues each video opened in the viewer and auto-advances to the next slide
-- Queue button on viewer topbar + download button on video controls
-- Duplicate protection: per-media identity (file id / message id), in-flight dedupe, remembers downloaded media so batch and auto-queue skip them, never overwrites files in the destination folder
-- Settings: language (VI / EN), file naming formats, prefix, sequence counter, destination folder, auto subfolders, forget downloaded list
-- Auto-update via `@updateURL` / `@downloadURL`
+Phiên bản đầu tiên.
+
+- Hai panel: *Tải xuống* và *Chọn hàng loạt*, kéo thả và thu gọn được.
+- Chọn ảnh hàng loạt: click, Shift+Click chọn dải, "Chọn tất cả hiển thị" có dấu tick trên từng ảnh.
+- Auto-queue cho video: tự xếp hàng video khi mở trong trình xem.
+- Nút "Thêm vào hàng chờ" trên thanh công cụ trình xem và nút tải trên trình phát video.
+- Chống trùng: nhớ media đã tải, không ghi đè file trong thư mục lưu.
+- Cài đặt: ngôn ngữ, định dạng tên file, tiền tố, số thứ tự, thư mục lưu, thư mục con.
+- Tự cập nhật qua Tampermonkey.
