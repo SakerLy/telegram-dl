@@ -27,7 +27,7 @@
   const TEST_MODE = typeof globalThis.__SK_TEST__ === "object"; // bật bởi bộ test Node: lộ nội bộ, bỏ qua dựng UI
 
   const SCRIPT_VERSION =
-    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.2.0";
+    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.2.1";
 
   const KB = 1024;
   const MB = 1024 * 1024;
@@ -195,7 +195,7 @@
     } catch { return fb; }
   };
   const saveStore = (k, v) => {
-    try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch {}
+    try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch { /* localStorage bị chặn hoặc đầy: bỏ qua */ }
   };
 
   const defaultLang = () =>
@@ -259,7 +259,7 @@
   const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+|\*)$/;
 
   const DEFAULT_SETTINGS = { naming: "original", prefix: "", subfolder: "none", connections: 3 };
-  let settings = Object.assign({}, DEFAULT_SETTINGS, TEST_MODE ? {} : loadStore("settings", {}));
+  const settings = Object.assign({}, DEFAULT_SETTINGS, TEST_MODE ? {} : loadStore("settings", {}));
   const getConnections = () => Math.min(4, Math.max(1, Number(settings.connections) || 3));
   let seqCounter = TEST_MODE ? 1 : loadStore("seq", 1);
 
@@ -285,7 +285,7 @@
         const tx = db.transaction("kv", "readwrite").objectStore("kv").put(v, k);
         tx.onsuccess = () => res(); tx.onerror = () => res();
       });
-    } catch {}
+    } catch { /* IndexedDB không dùng được: chỉ mất phần nhớ thư mục */ }
   };
   const idbDel = async (k) => {
     try {
@@ -294,7 +294,7 @@
         const tx = db.transaction("kv", "readwrite").objectStore("kv").delete(k);
         tx.onsuccess = () => res(); tx.onerror = () => res();
       });
-    } catch {}
+    } catch { /* IndexedDB không dùng được: chỉ mất phần nhớ thư mục */ }
   };
 
   // Giữ Blob đằng sau blob: URL do app tạo: tải bằng Blob.slice không qua mạng, vẫn đọc được sau khi app revoke URL
@@ -330,7 +330,7 @@
         const nativeRevoke = URL.revokeObjectURL?.bind(URL);
         URL.createObjectURL = function (obj) {
           const url = nativeCreate(obj);
-          try { remember(url, obj); } catch {}
+          try { remember(url, obj); } catch { /* lỗi của hook không được làm hỏng createObjectURL của app */ }
           return url;
         };
         if (nativeRevoke) {
@@ -518,7 +518,7 @@
       this.writable = null;
     }
     async abort() {
-      if (this.writable && !this.closed) { try { await this.writable.abort(); } catch {} }
+      if (this.writable && !this.closed) { try { await this.writable.abort(); } catch { /* stream đã đóng */ } }
       this.closed = true; this.writable = null;
     }
     get isClosed() { return this.closed || !this.writable; }
@@ -783,10 +783,10 @@
         }
       } catch (err) {
         // mọi lối thoát lỗi đều trả claim về ledger, nếu không Resume sẽ chờ một claim không ai giữ
-        if (claim) { try { ledger.release(claim); } catch {} claim = null; }
+        if (claim) { try { ledger.release(claim); } catch { /* claim đã được trả */ } claim = null; }
         // hủy task để các worker còn lại dừng ngay, không tải lại
         if (!task.pauseFlag && !task.controller.signal.aborted) {
-          try { task.controller.abort(err); } catch {}
+          try { task.controller.abort(err); } catch { /* controller đã bị hủy */ }
         }
         throw err;
       }
@@ -841,7 +841,8 @@
   }
 
   const hashCode = (s) => {
-    let h = 0, l = s.length, i = 0;
+    const l = s.length;
+    let h = 0, i = 0;
     while (i < l) h = ((h << 5) - h + s.charCodeAt(i++)) | 0;
     return h >>> 0;
   };
@@ -894,6 +895,7 @@
     "image/gif": ["gif"], "image/avif": ["avif"], "image/heic": ["heic"],
     "image/bmp": ["bmp"], "image/svg+xml": ["svg"],
   };
+  // eslint-disable-next-line no-control-regex -- loại ký tự điều khiển khỏi tên file là có chủ đích
   const sanitizeName = (s) => (s || "").replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_");
   const getDownloadFileName = (url, mime, kind) => {
     const meta = getMediaMetadata(url);
@@ -906,7 +908,7 @@
       try {
         const base = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop());
         if (/\.[a-z0-9]{2,5}$/i.test(base)) name = base;
-      } catch {}
+      } catch { /* URL không hợp lệ: dùng tên dự phòng bên dưới */ }
     }
     name = sanitizeName(name || hashCode(url).toString(36));
     const allowed = EXT_MAP[mime?.toLowerCase()] ||
@@ -1067,7 +1069,7 @@
     async close() { await this.inner?.close(); }
     async abort() { await this.inner?.abort(); }
     async discardCreatedFile() {
-      try { await this.task._createdFile?.remove?.(); } catch {}
+      try { await this.task._createdFile?.remove?.(); } catch { /* file đã bị xoá */ }
       this.task._createdFile = null;
     }
     get real() { return this.inner; }
@@ -1190,7 +1192,7 @@
         return;
       }
       // commit phần đã tải để Retry tiếp tục từ đó
-      if (task.writer) { try { await task.writer.close(); } catch {} }
+      if (task.writer) { try { await task.writer.close(); } catch { /* commit phần đã tải chỉ là cố gắng thêm */ } }
       if (!task.usedNativeFallback) {
         const fb = webaDownloadFallback(task.url, applyNaming(task.fileName));
         if (fb) {
@@ -1209,12 +1211,13 @@
     }
   };
 
+  const onTaskSettled = () => { runningCount--; pumpQueue(); };
   const pumpQueue = () => {
     while (runningCount < MAX_ACTIVE_TASKS && waitingQueue.length) {
       const task = waitingQueue.shift();
       if (task.finished || task.pauseFlag || task.running) continue;
       runningCount++;
-      runTask(task).finally(() => { runningCount--; pumpQueue(); });
+      runTask(task).finally(onTaskSettled);
     }
   };
 
@@ -2104,7 +2107,7 @@
         el.style.left = Math.max(4, Math.min(pos.left, maxL)) + "px";
         el.style.top = Math.max(4, Math.min(pos.top, maxT)) + "px";
         el.style.right = "auto"; el.style.bottom = "auto";
-      } catch {}
+      } catch { /* vị trí đã lưu bị hỏng: giữ vị trí mặc định */ }
     };
     requestAnimationFrame(apply);
     let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
@@ -2129,7 +2132,7 @@
     const end = (e) => {
       if (!dragging) return;
       dragging = false;
-      try { handle.releasePointerCapture(e.pointerId); } catch {}
+      try { handle.releasePointerCapture(e.pointerId); } catch { /* pointer đã được nhả */ }
       saveStore(storageKey, { left: parseFloat(el.style.left), top: parseFloat(el.style.top) });
     };
     handle.addEventListener("pointerup", end);
@@ -2312,7 +2315,7 @@
         document.dispatchEvent(new KeyboardEvent("keydown", {
           key: "ArrowRight", code: "ArrowRight", bubbles: true, cancelable: true,
         }));
-      } catch {}
+      } catch { /* không gửi được phím thì lần refresh sau thử lại */ }
       setTimeout(() => { autoAdvanceRunning = false; }, 350);
       return true;
     }
@@ -2321,7 +2324,7 @@
     const next = viewer.querySelector(WEBK_NEXT_SELECTORS);
     if (!next || next.classList.contains("hide") || !isUsableBtn(next)) return false;
     autoAdvanceRunning = true;
-    try { next.click(); } catch {}
+    try { next.click(); } catch { /* nút bị gỡ khỏi DOM giữa chừng */ }
     setTimeout(() => { autoAdvanceRunning = false; }, 350);
     return true;
   };
@@ -2341,7 +2344,6 @@
   };
 
   const BUBBLE_SELECTORS = ".bubble, .Message";
-  const VIDEO_HINT_SELECTOR = "[class*='play'], [class*='Play'], [class*='duration'], [class*='Duration']";
 
   const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message .media-inner";
   // kiểm tra closest() từ cả scope lẫn từng img: sticker (.sticker-media) và bản đồ (.Location) WebA cũng nằm trong .media-inner
@@ -2364,8 +2366,6 @@
   const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player, .media-inner.dark, .message-media-duration, .RoundVideo";
 
   const scopeIsVideoLike = (scope) => scope.matches(VIDEO_MARKERS) || !!scope.querySelector(VIDEO_MARKERS);
-  const looksLikeUnopenedVideo = (scope) =>
-    !scope.querySelector("video") && (scopeIsVideoLike(scope) || !!scope.querySelector(VIDEO_HINT_SELECTOR));
 
   const pickPhotoScopes = (root) =>
     Array.from(root.querySelectorAll(PHOTO_SCOPE_SELECTOR)).filter((s) => {
@@ -2586,8 +2586,8 @@
   // ở cả tweb (listLoader: next = msgid cao hơn) lẫn telegram-tt (getNextItem: messageMediaIds[i + 1]),
   // slide kế tiếp là media kế tiếp phía dưới trong chat. Đi từng slide, dừng ngay khi đã gặp đủ số video đó.
   const AQ_PENDING_TIMEOUT_MS = 15000; // slide video mãi không có src: bỏ qua
-  const AQ_STUCK_MS = 2500;            // đã bấm next mà slide không đổi: bấm lại
-  const AQ_END_RETRIES = 8;            // nút next ẩn có thể chỉ là viewer đang tải thêm slide
+  const AQ_STUCK_MS = 2500; // đã bấm next mà slide không đổi: bấm lại
+  const AQ_END_RETRIES = 8; // nút next ẩn có thể chỉ là viewer đang tải thêm slide
   let aqPlan = null;
 
   const POST_ITEM_SELECTOR = ".album-item, .bubble__media-container, .attachment, .media-inner";
