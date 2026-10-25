@@ -11,14 +11,26 @@ A userscript to download photos, videos, GIFs and voice messages from **Telegram
 
 ### Tính năng
 
-- Tải từng file ngay trong trình xem media
-- Chọn và tải hàng loạt ảnh, có dấu tick trên từng ảnh
+**Engine v2.0 — viết lại theo kiến trúc tải file của 2 client Web chính thức của Telegram** ([WebK](https://github.com/morethanwords/tweb) + [WebA](https://github.com/Ajaxy/telegram-tt)):
+
+- **Tải song song** nhiều chunk đồng thời mỗi file (mặc định 3 luồng như Telegram WebA, chỉnh 1–4 trong Settings)
+- **Tự động retry** chunk lỗi 5 lần với backoff lũy tiến (250ms → 8s + jitter), tự thu nhỏ chunk khi timeout
+- **Resume trong phiên**: lỗi giữa chừng bấm *Retry* tải tiếp từ chỗ dừng, không tải lại từ đầu; có **Pause/Resume**
+- **Tốc độ thực + ETA** (cửa sổ trượt 3s gần nhất)
+- **Chống treo**: stall timeout 60s, watchdog 120s, tự retry task khi mạng nhấp nháy
+- **File lớn an toàn**: ghi trực tiếp xuống disk theo position (Chrome/Edge/Brave); Firefox tự chuyển sang endpoint download gốc của Telegram khi file > 1,2 GB
+- Video **WebA** (`web.telegram.org/a/`) giờ tải được ổn định (v1 hay lỗi)
+
+Cùng các tính năng từ v1:
+
+- Tải từng file ngay trong trình xem media; nút tải thêm vào cả stories và pinned audio
+- Chọn và tải hàng loạt ảnh, có dấu tick trên từng ảnh, Shift+Click chọn dải
 - Auto-queue: tự tải toàn bộ video trong một post, dừng khi hết video
 - Chống trùng: không tải lại media đã tải, không ghi đè file
-- Tuỳ chỉnh tên file, thư mục lưu và thư mục con theo ngày hoặc kênh
+- Tuỳ chỉnh tên file, tiền tố, thư mục lưu và thư mục con theo ngày hoặc kênh
 - Giao diện tiếng Việt và tiếng Anh, tự cập nhật phiên bản mới
 
-Hỗ trợ `web.telegram.org/k/` (WebK) và `web.telegram.org/a/` (WebA). Một số tính năng như Auto-queue chỉ có trên WebK.
+Hỗ trợ `web.telegram.org/k/` (WebK) và `web.telegram.org/a/` (WebA). Auto-queue chỉ có trên WebK.
 
 ### Cài đặt
 
@@ -42,6 +54,8 @@ Hỗ trợ `web.telegram.org/k/` (WebK) và `web.telegram.org/a/` (WebA). Một 
 2. Click vào media đầu tiên của post. Script đếm số video trong post ngay lúc này.
 3. Script tự tải từng video, bỏ qua ảnh, tự chuyển slide và dừng khi đủ video của post.
 
+**Pause / Resume / Retry.** Mỗi task trong panel *Tải xuống* có nút Tạm dừng — Tiếp tục — Thử lại. Thử lại sau khi lỗi chỉ tải phần chưa xong, không tải lại từ đầu.
+
 ### Cài đặt nâng cao
 
 Bấm biểu tượng bánh răng trên panel.
@@ -49,6 +63,7 @@ Bấm biểu tượng bánh răng trên panel.
 | Mục | Mô tả |
 |---|---|
 | Ngôn ngữ | Tiếng Việt hoặc English |
+| Số luồng tải mỗi file | 1–4 chunk song song (mặc định 3, như Telegram WebA) |
 | Định dạng tên file | Tên gốc, ngày giờ, số thứ tự, hoặc kết hợp |
 | Tiền tố | Chuỗi thêm vào đầu tên file |
 | Thư mục lưu | Lưu vào thư mục riêng thay cho Downloads |
@@ -56,6 +71,8 @@ Bấm biểu tượng bánh răng trên panel.
 | Media đã tải | Số media đã nhớ để không tải lại, có nút **Quên hết** |
 
 Thư mục lưu và thư mục con chỉ dùng được trên Chrome, Edge, Brave và Opera. Trên Brave cần bật `brave://flags/#file-system-access-api` rồi khởi động lại trình duyệt. Sau mỗi lần khởi động lại trình duyệt, lần tải đầu tiên sẽ hỏi lại quyền ghi thư mục.
+
+Trên Firefox (không có File System Access): file nhỏ và vừa tải qua bộ nhớ rồi gửi trình duyệt lưu; file lớn hơn 1,2 GB trên WebA tự chuyển cho endpoint download gốc của Telegram để stream thẳng xuống disk.
 
 ### Phím tắt
 
@@ -72,7 +89,7 @@ Thư mục lưu và thư mục con chỉ dùng được trên Chrome, Edge, Brav
 | Không thấy panel | Tải lại trang, kiểm tra script đang bật trong Tampermonkey |
 | Nút **Chọn thư mục** bị xám | Trình duyệt không hỗ trợ, hoặc Brave chưa bật flag ở trên |
 | Click vào video không chọn được | Chế độ chọn chỉ dành cho ảnh, dùng Auto-queue cho video |
-| Ảnh vừa cuộn tới không được chọn | Đợi ảnh tải xong rồi bấm lại |
+| Tốc độ không tăng | Thử tăng *Số luồng* trong Settings; tốc độ còn phụ thuộc giới hạn server Telegram cho tài khoản thường (premium được nhanh hơn) |
 | Lỗi khác | Mở Console (F12), gửi các dòng `[sakerly]` kèm ảnh chụp vào Issues |
 
 Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampermonkey → Dashboard → **Check for userscript updates**.
@@ -83,14 +100,26 @@ Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampe
 
 ### Features
 
-- Download any single file from the media viewer
-- Batch-select and download photos, with a tick on each selected photo
+**v2.0 engine — rewritten after the file-download architecture of the two official Telegram Web clients** ([WebK](https://github.com/morethanwords/tweb) + [WebA](https://github.com/Ajaxy/telegram-tt)):
+
+- **True parallel download**: N concurrent chunks per file (default 3, matching Telegram WebA; configurable 1–4 in Settings)
+- **Automatic retry**: up to 5 attempts per chunk with exponential backoff (250ms → 8s + jitter), auto-shrinking chunk size on repeated timeouts
+- **In-session resume**: after a failure, *Retry* continues from where it stopped instead of restarting; **Pause/Resume** supported
+- **Real speed + ETA** (3-second sliding window)
+- **Hang-proof**: 60s stall timeout, 120s watchdog, task-level auto-retry on network blips
+- **Large-file safe**: streams straight to disk with positioned writes (Chrome/Edge/Brave); on Firefox, files > 1.2 GB fall back to Telegram's own download endpoint (browser streams to disk, zero RAM)
+- WebA (`web.telegram.org/a/`) videos now download reliably
+
+Plus everything from v1:
+
+- Download any single file from the media viewer; buttons added to stories and pinned audio too
+- Batch-select and download photos, with a tick on each selected photo, Shift+Click for ranges
 - Auto-queue: downloads every video in a post and stops when they're done
 - Duplicate protection: skips media already downloaded, never overwrites files
 - Configurable file names, destination folder and date/channel subfolders
 - Vietnamese and English UI, automatic updates
 
-Supports `web.telegram.org/k/` (WebK) and `web.telegram.org/a/` (WebA). Some features, such as Auto-queue, are WebK only.
+Supports `web.telegram.org/k/` (WebK) and `web.telegram.org/a/` (WebA). Auto-queue is WebK only.
 
 ### Installation
 
@@ -114,6 +143,8 @@ Supports `web.telegram.org/k/` (WebK) and `web.telegram.org/a/` (WebA). Some fea
 2. Click the first media of a post. The script counts the post's videos at that moment.
 3. It downloads each video, skips photos, advances slides by itself and stops once the post's videos are done.
 
+**Pause / Resume / Retry.** Every task in the *Downloads* panel has Pause — Resume — Retry controls. Retrying after a failure only fetches the missing part, never from scratch.
+
 ### Settings
 
 Click the gear icon on either panel.
@@ -121,6 +152,7 @@ Click the gear icon on either panel.
 | Option | Description |
 |---|---|
 | Language | Tiếng Việt or English |
+| Connections per file | 1–4 parallel chunks (default 3, same as Telegram WebA) |
 | File naming | Original name, date-time, sequence number, or a combination |
 | Prefix | Text prepended to every file name |
 | Destination folder | Save into a folder of your choice instead of Downloads |
@@ -128,6 +160,8 @@ Click the gear icon on either panel.
 | Downloaded media | How many media are remembered and won't be downloaded again, with a **Forget all** button |
 
 Destination folder and subfolders work on Chrome, Edge, Brave and Opera only. On Brave, enable `brave://flags/#file-system-access-api` and relaunch. After each browser restart, the first download asks for folder permission again.
+
+On Firefox (no File System Access): small and medium files are buffered in memory and handed to the browser; files larger than 1.2 GB on WebA fall back to Telegram's own download endpoint and stream straight to disk.
 
 ### Shortcuts
 
@@ -144,11 +178,11 @@ Destination folder and subfolders work on Chrome, Edge, Brave and Opera only. On
 | Panels don't appear | Reload the page and check the script is enabled in Tampermonkey |
 | **Pick folder** is greyed out | Browser not supported, or the Brave flag above isn't enabled |
 | Clicking a video doesn't select it | Select mode is for photos only; use Auto-queue for videos |
-| A photo just scrolled into view isn't selected | Wait for it to finish loading, then press again |
+| Speed doesn't improve | Raise *Connections* in Settings; throughput is also capped by Telegram servers for regular accounts (premium is faster) |
 | Anything else | Open the Console (F12) and send the `[sakerly]` lines plus a screenshot to Issues |
 
 The script checks for updates every 24 hours. To check now: Tampermonkey → Dashboard → **Check for userscript updates**.
 
 ---
 
-Built by **SakerLy**
+Built by **SakerLy** — v2.0 engine inspired by the download pipelines of [tweb](https://github.com/morethanwords/tweb) and [telegram-tt](https://github.com/Ajaxy/telegram-tt).

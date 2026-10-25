@@ -2,10 +2,10 @@
 // @name         Telegram Media Downloader
 // @name:en      Telegram Media Downloader
 // @name:vi      Trình tải media Telegram
-// @version      1.0
+// @version      2.1.0
 // @namespace    sakerly
-// @description  Tải ảnh, GIF, video, voice từ Telegram Web, kể cả kênh cấm lưu — hỗ trợ chọn hàng loạt + auto-queue video khi mở viewer.
-// @description:en  Download images, GIFs, videos and voice from Telegram Web (incl. restricted channels). Multi-select batch + auto-queue video on viewer open.
+// @description  Tải ảnh, GIF, video, voice từ Telegram Web (WebK + WebA) — engine song song kiểu client chính thức: nhiều chunk đồng thời, retry backoff, resume trong phiên, tốc độ thực + ETA.
+// @description:en  Download images, GIFs, videos and voice from Telegram Web (WebK + WebA) — official-client-style parallel engine: concurrent chunks, retry with backoff, in-session resume, real speed + ETA.
 // @author       SakerLy
 // @match        https://web.telegram.org/*
 // @match        https://webk.telegram.org/*
@@ -13,66 +13,116 @@
 // @icon         https://web.telegram.org/k/assets/img/android-chrome-144x144.png
 // @run-at       document-end
 // @grant        none
-// @homepageURL  https://github.com/SakerLy/telegram-media-downloader
-// @supportURL   https://github.com/SakerLy/telegram-media-downloader/issues
+// @homepageURL  https://github.com/SakerLy/telegram-dl
+// @supportURL   https://github.com/SakerLy/telegram-dl/issues
 // @updateURL    https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js
 // @downloadURL  https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js
 // ==/UserScript==
 
+/*
+ * telegram-dl v2 — parallel download engine cho Telegram Web (WebK + WebA).
+ * Pattern mượn từ 2 client chính thức: RangeLedger kiểu FileView (WebA),
+ * N worker chunk 512KB-aligned, retry backoff 250ms×2^n (mediaLoader WebA),
+ * stall timeout 60s (SENDER_TIMEOUT), BlobRegistry hook createObjectURL,
+ * FsWriter positioned-writes + resume, fallback native `download/` (WebA).
+ */
+
 (function () {
   "use strict";
 
-  // read from the userscript header via the manager so @version stays the single source of truth
-  const SCRIPT_VERSION = (typeof GM_info !== "undefined" && GM_info?.script?.version) || "1.0";
+  const TEST_MODE = typeof globalThis.__SK_TEST__ === "object"; // headless Node test hook
 
-  // ===== i18n (VI default, EN fallback) =====================================
+  const SCRIPT_VERSION =
+    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.1.0";
+
+  // ===========================================================================
+  // SECTION 1: hằng số engine / engine constants
+  // ===========================================================================
+  const KB = 1024;
+  const MB = 1024 * 1024;
+
+  // Chunk size bội số grid 512KB — khớp grid SW WebK (512KB/1MB) và clamp 512KB của SW WebA
+  const CHUNK_GRID = 512 * KB;
+  const CHUNK_DEFAULT = 512 * KB;
+  const CHUNK_MAX = 1024 * KB; // = MAX_DOWNLOAD_FILE_PART_SIZE (tweb & gramjs)
+  const CHUNK_MIN = 256 * KB;
+
+  // Mirror WebA: MAX_MEDIA_RETRIES = 5, backoff 250ms×2^n + jitter
+  const CHUNK_RETRIES = 5;
+  const RETRY_BASE_MS = 250;
+  const RETRY_MAX_MS = 8000;
+
+  // Không nhận byte nào trong 60s → abort + retry (SW WebA cho part chờ tới 60s)
+  const STALL_TIMEOUT_MS = 60 * 1000;
+
+  // Tổng byte in-flight tối đa mọi task — kiểu dcBandwidthManager WebA (9MB), nới 12MB
+  const NET_BUDGET_BYTES = 12 * MB;
+
+  const MAX_ACTIVE_TASKS = 2; // số task chạy đồng thời (mỗi task có N worker bên trong)
+
+  const WATCHDOG_MS = 120 * 1000; // không tiến bộ 120s → fail task
+
+  // Tự pump lại task 1 lần sau 3s nếu lỗi retryable (network blip)
+  const TASK_AUTO_RETRY_MAX = 1;
+  const TASK_AUTO_RETRY_DELAY = 3000;
+
+  // BlobRegistry: cap số Blob và tổng bytes được giữ
+  const BLOB_REGISTRY_MAX = 96;
+  const BLOB_REGISTRY_BYTES = 384 * MB;
+
+  const DOWNLOADED_CAP = 5000;
+  const REFRESH_DELAY = 2000;
+
+  // ===========================================================================
+  // SECTION 2: i18n (VI mặc định, EN fallback)
+  // ===========================================================================
   const LANGS = {
     vi: {
       downloads: "Tải xuống", downloadsCount: "Tải xuống ({count})",
-      mediaDownloads: "Tải media", download: "Tải xuống", loadingMedia: "Media đang tải",
+      download: "Tải xuống", loadingMedia: "Media đang tải",
       hide: "Ẩn", show: "Hiện", dismiss: "Bỏ khỏi danh sách",
       progress: "Tiến trình tải", cancel: "Hủy", retry: "Thử lại",
+      pause: "Tạm dừng", resume: "Tiếp tục",
       preparing: "Đang chuẩn bị", queued: "Đang chờ", downloading: "Đang tải",
-      saving: "Đang lưu", completed: "Hoàn tất", handedOff: "Đã gửi cho trình duyệt",
-      failed: "Thất bại", cancelled: "Đã hủy",
-      rate: "{speed}/s", video: "video", audio: "âm thanh", image: "ảnh",
-      unknownType: "định dạng không xác định",
-      errorHttp: "Yêu cầu tải thất bại (HTTP {status})",
+      paused: "Đã tạm dừng", saving: "Đang lưu", completed: "Hoàn tất",
+      handedOff: "Trình duyệt tự tải", failed: "Thất bại", cancelled: "Đã hủy",
+      resumedTask: "Tiếp tục từ {percent}%",
+      eta: "còn {time}", rate: "{speed}/s",
+      video: "video", audio: "âm thanh", image: "ảnh", unknownType: "không rõ định dạng",
+      errorHttp: "Yêu cầu thất bại (HTTP {status})",
       errorMime: "Cần {kind}, nhận được {mime}",
       errorRangeMissing: "Thiếu hoặc sai Content-Range",
       errorRangeInconsistent: "Dữ liệu không khớp; đã dừng để tránh file hỏng",
-      errorRangeUnsupported: "Server không hỗ trợ tải từng phần",
+      errorRangeUnsupported: "Nguồn không hỗ trợ tải từng phần",
       errorLength: "Content-Length không hợp lệ", errorEmpty: "Phản hồi rỗng",
       errorTooLarge: "Dữ liệu vượt kích thước dự kiến",
       errorIncomplete: "Dữ liệu không đầy đủ",
-      errorTimeout: "Không nhận được dữ liệu trong 30 giây",
-      errorUnexpected: "Tải thất bại: {message}",
+      errorStall: "Không nhận được dữ liệu trong 60 giây",
+      errorNoData: "Nguồn không trả về dữ liệu",
+      errorFatal: "Tải thất bại: {message}",
       selectTitle: "Chọn hàng loạt",
       selectMode: "Chế độ chọn", selectAll: "Chọn tất cả hiển thị",
       clearSelection: "Bỏ chọn", downloadSelected: "Tải mục đã chọn ({count})",
-      batchQueued: "Đã thêm {count} mục vào hàng chờ",
-      autoQueue: "Auto-queue video", autoQueueOn: "Auto-queue video ✓",
-      autoQueueHint: "Mở video trong viewer sẽ tự thêm vào hàng chờ.",
+      noTasks: "Chưa có tải xuống nào",
+      autoQueue: "Auto-queue video",
       hintPhoto: "Ảnh: bật <b>Chế độ chọn</b> → click bubble",
       hintVideo: "Video: bật <b>Auto-queue</b> → mở viewer → mũi tên",
       hintKeys: "Ctrl+Shift+M · A · D",
-      lang: "Ngôn ngữ",
       topbarQueue: "Thêm vào hàng chờ",
       settings: "Cài đặt", settingsTitle: "Cài đặt tải xuống",
+      connections: "Số luồng tải mỗi file",
+      connectionsHint: "1–4 luồng song song (mặc định 3, như Telegram WebA)",
       naming: "Định dạng tên file",
       namingOriginal: "Tên gốc", namingDate: "Ngày giờ",
       namingSeq: "Số thứ tự", namingDateOriginal: "Ngày giờ + Tên gốc",
       namingSeqOriginal: "Số thứ tự + Tên gốc",
-      prefix: "Tiền tố (tuỳ chọn)",
-      prefixPlaceholder: "VD: channelname",
+      prefix: "Tiền tố (tuỳ chọn)", prefixPlaceholder: "VD: channelname",
       folder: "Thư mục lưu",
       pickFolder: "Chọn thư mục", clearFolder: "Bỏ chọn",
       folderNone: "Chưa chọn (dùng thư mục Downloads mặc định)",
       folderUnsupported: "Trình duyệt không hỗ trợ chọn thư mục",
-      resetSeq: "Đặt lại số thứ tự",
-      seqNow: "Số kế tiếp: {n}",
-      close: "Đóng",
-      clearHistory: "Xoá lịch sử",
+      resetSeq: "Đặt lại số thứ tự", seqNow: "Số kế tiếp: {n}",
+      close: "Đóng", clearHistory: "Xoá danh sách tải",
       skippedDownloaded: "Bỏ qua {n} mục đã tải trước đó",
       postVideosDone: "Xong post: {n} video",
       downloadedCount: "Đã nhớ {n} media đã tải (không tải lại)",
@@ -83,53 +133,54 @@
       subfolderChannel: "Theo kênh/chat",
       subfolderDateChannel: "Ngày / Kênh",
       subfolderChannelDate: "Kênh / Ngày",
+      lang: "Ngôn ngữ",
     },
     en: {
       downloads: "Downloads", downloadsCount: "Downloads ({count})",
-      mediaDownloads: "Media downloads", download: "Download", loadingMedia: "Loading media",
+      download: "Download", loadingMedia: "Loading media",
       hide: "Hide", show: "Show", dismiss: "Dismiss",
       progress: "Download progress", cancel: "Cancel", retry: "Retry",
+      pause: "Pause", resume: "Resume",
       preparing: "Preparing", queued: "Queued", downloading: "Downloading",
-      saving: "Saving", completed: "Completed", handedOff: "Handed to browser",
-      failed: "Failed", cancelled: "Cancelled",
-      rate: "{speed}/s", video: "video", audio: "audio", image: "image",
-      unknownType: "unknown type",
+      paused: "Paused", saving: "Saving", completed: "Completed",
+      handedOff: "Browser is downloading", failed: "Failed", cancelled: "Cancelled",
+      resumedTask: "Resuming from {percent}%",
+      eta: "{time} left", rate: "{speed}/s",
+      video: "video", audio: "audio", image: "image", unknownType: "unknown type",
       errorHttp: "Request failed (HTTP {status})",
       errorMime: "Expected {kind}, got {mime}",
       errorRangeMissing: "Missing or invalid Content-Range",
       errorRangeInconsistent: "Mismatched data; aborted to avoid corruption",
-      errorRangeUnsupported: "Server does not support ranged requests",
+      errorRangeUnsupported: "Source does not support ranged requests",
       errorLength: "Invalid Content-Length", errorEmpty: "Empty response",
       errorTooLarge: "Data exceeds expected size",
       errorIncomplete: "Incomplete data",
-      errorTimeout: "No data received within 30 seconds",
-      errorUnexpected: "Download failed: {message}",
+      errorStall: "No data received within 60 seconds",
+      errorNoData: "Source returned no data",
+      errorFatal: "Download failed: {message}",
       selectTitle: "Batch select",
       selectMode: "Select mode", selectAll: "Select all visible",
       clearSelection: "Clear", downloadSelected: "Download selected ({count})",
-      batchQueued: "Queued {count} items",
-      autoQueue: "Auto-queue video", autoQueueOn: "Auto-queue video ✓",
-      autoQueueHint: "Opening a video in viewer will auto-queue it.",
+      noTasks: "No downloads yet",
+      autoQueue: "Auto-queue video",
       hintPhoto: "Photos: enable <b>Select mode</b> → click bubble",
       hintVideo: "Videos: enable <b>Auto-queue</b> → open viewer → arrow",
       hintKeys: "Ctrl+Shift+M · A · D",
-      lang: "Language",
       topbarQueue: "Add to queue",
       settings: "Settings", settingsTitle: "Download settings",
+      connections: "Connections per file",
+      connectionsHint: "1–4 parallel chunks (default 3, same as Telegram WebA)",
       naming: "File naming",
       namingOriginal: "Original name", namingDate: "Date-time",
       namingSeq: "Sequence number", namingDateOriginal: "Date + Original",
       namingSeqOriginal: "Sequence + Original",
-      prefix: "Prefix (optional)",
-      prefixPlaceholder: "e.g. channelname",
+      prefix: "Prefix (optional)", prefixPlaceholder: "e.g. channelname",
       folder: "Destination folder",
       pickFolder: "Pick folder", clearFolder: "Clear",
       folderNone: "Not set (browser Downloads folder)",
       folderUnsupported: "Browser does not support folder picker",
-      resetSeq: "Reset sequence",
-      seqNow: "Next number: {n}",
-      close: "Close",
-      clearHistory: "Clear history",
+      resetSeq: "Reset sequence", seqNow: "Next number: {n}",
+      close: "Close", clearHistory: "Clear download list",
       skippedDownloaded: "Skipped {n} already downloaded",
       postVideosDone: "Post done: {n} video(s)",
       downloadedCount: "Remembering {n} downloaded media (won't re-download)",
@@ -140,15 +191,27 @@
       subfolderChannel: "By channel/chat",
       subfolderDateChannel: "Date / Channel",
       subfolderChannelDate: "Channel / Date",
+      lang: "Language",
     },
   };
 
+  // ===========================================================================
+  // SECTION 3: tiện ích chung / common utilities
+  // ===========================================================================
   const STORAGE_PREFIX = "sakerly:";
-  const loadStore = (k, fb) => { try { const v = localStorage.getItem(STORAGE_PREFIX + k); return v == null ? fb : JSON.parse(v); } catch { return fb; } };
-  const saveStore = (k, v) => { try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch {} };
+  const loadStore = (k, fb) => {
+    try {
+      const v = localStorage.getItem(STORAGE_PREFIX + k);
+      return v == null ? fb : JSON.parse(v);
+    } catch { return fb; }
+  };
+  const saveStore = (k, v) => {
+    try { localStorage.setItem(STORAGE_PREFIX + k, JSON.stringify(v)); } catch {}
+  };
 
-  const defaultLang = () => (navigator.language || "en").toLowerCase().startsWith("vi") ? "vi" : "en";
-  let currentLang = loadStore("lang", defaultLang());
+  const defaultLang = () =>
+    ((typeof navigator !== "undefined" && navigator.language) || "en").toLowerCase().startsWith("vi") ? "vi" : "en";
+  let currentLang = TEST_MODE ? "vi" : loadStore("lang", defaultLang());
   if (!LANGS[currentLang]) currentLang = "en";
   const t = (key, params = {}) =>
     (LANGS[currentLang][key] ?? LANGS.en[key] ?? key).replace(
@@ -162,7 +225,7 @@
     Object.assign(new Error(t(key, params)), { name, translationKey: key, params });
   const formatError = (err) => {
     if (!err) return "";
-    if (!err.translationKey) return t("errorUnexpected", { message: err.message || String(err) });
+    if (!err.translationKey) return t("errorFatal", { message: err.message || String(err) });
     const p = { ...err.params };
     if (err.translationKey === "errorMime") { p.kind = t(p.kind); p.mime ||= t("unknownType"); }
     return t(err.translationKey, p);
@@ -170,165 +233,726 @@
 
   const log = {
     info: (m, f = null) => console.log(`[sakerly]${f ? ` ${f}:` : ""} ${m}`),
+    warn: (m, f = null) => console.warn(`[sakerly]${f ? ` ${f}:` : ""} ${m}`),
     error: (m, f = null) => console.error(`[sakerly]${f ? ` ${f}:` : ""} ${m}`),
   };
 
-  // ===== native download button discovery (WebK) ============================
-  const WEBK_DL_SELECTOR = [
-    "button.quality-download-options-button-menu",
-    "button.tgico-download",
-    'button[aria-label="Download"]',
-    'button[title="Download"]',
-  ].join(",");
-  const getWebKDlButtons = (c) =>
-    Array.from(c.querySelectorAll(WEBK_DL_SELECTOR)).filter(
-      (b) => !b.matches(".sakerly-dl, ._sakerly_pinned_dl")
-    );
-  const isUsableBtn = (b) => {
-    if (b.disabled || b.getAttribute("aria-disabled") === "true" ||
-        b.hidden || b.classList.contains("hide") || b.closest("[inert]")) return false;
-    const s = getComputedStyle(b);
-    return s.visibility !== "hidden" && s.visibility !== "collapse" && b.getClientRects().length > 0;
-  };
-
-  let webKGlyph = "";
-  const dlIconSvg =
-    '<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></svg>';
-  const createWebKDlIcon = (btnIcon = false) =>
-    `<span class="tgico sakerly-dl-icon${btnIcon ? " button-icon" : ""}" aria-hidden="true">${webKGlyph || dlIconSvg}</span>`;
-  const refreshWebKGlyph = () => {
-    for (const b of getWebKDlButtons(document)) {
-      const g = b.querySelector(":scope > .tgico")?.textContent.trim();
-      if (!g || !/^[\uE000-\uF8FF]$/.test(g)) continue;
-      if (g !== webKGlyph) {
-        webKGlyph = g;
-        document.querySelectorAll(".sakerly-dl-icon").forEach((i) => (i.textContent = g));
-      }
-      return;
-    }
-  };
-
-  // ===== range-fetch download engine ========================================
-  const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+)$/;
-  const REFRESH_DELAY = 2000;
-  const CHUNK_SIZE = 4 * 1024 * 1024;
-
-  const fetchMediaPart = async (url, offset, total, kind, opts = {}) => {
-    const controller = new AbortController();
-    const abort = () => controller.abort(opts.signal?.reason);
-    let timer, reader;
-    const resetTimeout = () => {
+  const sleep = (ms, signal) => new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, ms);
+    function finish() {
       clearTimeout(timer);
-      timer = setTimeout(() => controller.abort(downloadError("errorTimeout", {}, "TimeoutError")), 30000);
-    };
-    const checkAbort = () => { if (controller.signal.aborted) throw controller.signal.reason; };
-    if (opts.signal?.aborted) abort();
-    opts.signal?.addEventListener("abort", abort, { once: true });
-    resetTimeout();
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    function onAbort() { finish(); reject(signal.reason); }
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+
+  const formatBytes = (bytes) => {
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.min(Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)), u.length - 1);
+    return `${(i ? decFmt() : intFmt()).format(bytes / 1024 ** i)} ${u[i]}`;
+  };
+
+  const formatDuration = (sec) => {
+    if (!Number.isFinite(sec) || sec < 0) return "–";
+    sec = Math.round(sec);
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  };
+
+  // Backoff lũy tiến + jitter — pattern getRetryTimeout (250ms × 2^n) của WebA
+  const backoffDelay = (attempt) =>
+    Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS) + Math.random() * 250;
+
+  const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+|\*)$/;
+
+  // ===========================================================================
+  // SECTION 4: cài đặt / settings
+  // ===========================================================================
+  const DEFAULT_SETTINGS = { naming: "original", prefix: "", subfolder: "none", connections: 3 };
+  let settings = Object.assign({}, DEFAULT_SETTINGS, TEST_MODE ? {} : loadStore("settings", {}));
+  const getConnections = () => Math.min(4, Math.max(1, Number(settings.connections) || 3)); // chốt 1..4
+  let seqCounter = TEST_MODE ? 1 : loadStore("seq", 1);
+
+  // --- IndexedDB giữ directory handle qua reload ---
+  const openIDB = () => new Promise((res, rej) => {
+    const r = indexedDB.open("sakerly", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("kv");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  const idbGet = async (k) => {
     try {
-      checkAbort();
-      const res = await fetch(url, {
-        headers: { Range: `bytes=${offset}-${offset + CHUNK_SIZE - 1}` },
+      const db = await openIDB();
+      return await new Promise((res) => {
+        const tx = db.transaction("kv").objectStore("kv").get(k);
+        tx.onsuccess = () => res(tx.result); tx.onerror = () => res(null);
+      });
+    } catch { return null; }
+  };
+  const idbSet = async (k, v) => {
+    try {
+      const db = await openIDB();
+      await new Promise((res) => {
+        const tx = db.transaction("kv", "readwrite").objectStore("kv").put(v, k);
+        tx.onsuccess = () => res(); tx.onerror = () => res();
+      });
+    } catch {}
+  };
+  const idbDel = async (k) => {
+    try {
+      const db = await openIDB();
+      await new Promise((res) => {
+        const tx = db.transaction("kv", "readwrite").objectStore("kv").delete(k);
+        tx.onsuccess = () => res(); tx.onerror = () => res();
+      });
+    } catch {}
+  };
+
+  // ===========================================================================
+  // SECTION 5: BlobRegistry — hook URL.createObjectURL
+  // ===========================================================================
+  // WebK/WebA gán media src = blob: URL do app tự tạo. Hook giữ tham chiếu Blob
+  // gốc: tải blob: bằng Blob.slice trực tiếp (0 network), Blob vẫn đọc được sau
+  // khi app revokeObjectURL (revoke chỉ hủy URL, không hủy Blob).
+  const BlobRegistry = (() => {
+    const map = new Map(); // url -> {obj, bytes, ts}
+    let totalBytes = 0;
+
+    const remember = (url, obj) => {
+      if (!url || typeof url !== "string" || !url.startsWith("blob:")) return url;
+      const bytes = (obj && typeof obj.size === "number") ? obj.size : 0;
+      map.set(url, { obj, bytes, ts: Date.now() });
+      totalBytes += bytes;
+      while (map.size > BLOB_REGISTRY_MAX || (totalBytes > BLOB_REGISTRY_BYTES && map.size > 1)) {
+        const oldest = map.keys().next().value; // LRU: đuổi entry cũ nhất
+        if (oldest === undefined) break;
+        totalBytes -= map.get(oldest).bytes;
+        map.delete(oldest);
+      }
+      return url;
+    };
+
+    const get = (url) => {
+      const e = map.get(url);
+      if (!e) return null;
+      map.delete(url); map.set(url, e); e.ts = Date.now(); // touch LRU
+      return e.obj;
+    };
+
+    const install = () => {
+      try {
+        if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") return;
+        const nativeCreate = URL.createObjectURL.bind(URL);
+        const nativeRevoke = URL.revokeObjectURL?.bind(URL);
+        URL.createObjectURL = function (obj) {
+          const url = nativeCreate(obj);
+          try { remember(url, obj); } catch {}
+          return url;
+        };
+        if (nativeRevoke) {
+          URL.revokeObjectURL = function (url) {
+            return nativeRevoke(url); // không xóa khỏi registry — Blob vẫn còn cho download
+          };
+        }
+      } catch (e) { log.warn("BlobRegistry install failed: " + e.message); }
+    };
+
+    return { install, get, remember, size: () => map.size };
+  })();
+  if (!TEST_MODE) BlobRegistry.install();
+
+  // ===========================================================================
+  // SECTION 6: SpeedMeter — tốc độ thực cửa sổ trượt 3s
+  // ===========================================================================
+  class SpeedMeter {
+    constructor(windowMs = 3000) {
+      this.windowMs = windowMs;
+      this.samples = []; // [ts, cumulativeBytes]
+      this.total = 0;
+      this.last = performance.now();
+    }
+    push(bytes) {
+      const now = performance.now();
+      this.total += bytes;
+      this.samples.push([now, this.total]);
+      const cutoff = now - this.windowMs; // giữ mẫu trong cửa sổ
+      while (this.samples.length > 2 && this.samples[0][0] < cutoff) this.samples.shift();
+    }
+    speed() {
+      if (this.samples.length < 2) return 0;
+      const first = this.samples[0], last = this.samples[this.samples.length - 1];
+      const dt = (last[0] - first[0]) / 1000;
+      if (dt <= 0.05) return 0;
+      return Math.max(0, (last[1] - first[1]) / dt);
+    }
+  }
+
+  // ===========================================================================
+  // SECTION 7: RangeLedger — bản đồ interval kiểu FileView (WebA)
+  // ===========================================================================
+  // Theo dõi khoảng byte đã có. Worker "claim" một khoảng trống, dữ liệu về
+  // thì markComplete; thiếu bao nhiêu trả lại làm hole cho lần fetch sau.
+  // Interval-based nên out-of-order + resume tự nhiên.
+  class RangeLedger {
+    constructor() {
+      this.total = null; // chưa biết cho tới response đầu
+      this.done = [];    // interval [start,end) đã xong, sorted, disjoint
+      this.claimed = []; // interval [start,end) đang được worker giữ
+      this._received = 0;
+    }
+
+    get received() { return this._received; }
+    get remaining() { return this.total == null ? null : Math.max(0, this.total - this._received); }
+    isComplete() { return this.total != null && this._received >= this.total; }
+
+    setTotal(total) {
+      if (this.total != null && this.total !== total) {
+        throw downloadError("errorRangeInconsistent", {}, "InconsistentError");
+      }
+      this.total = total;
+    }
+
+    // gộp interval vào list sorted disjoint (dùng cho mark/release)
+    _insertInto(list, start, end) {
+      const out = [];
+      let placed = false;
+      let s = start, e = end;
+      for (const [is, ie] of list) {
+        if (ie < s) { out.push([is, ie]); continue; }
+        if (is > e) { if (!placed) { out.push([s, e]); placed = true; } out.push([is, ie]); continue; }
+        s = Math.min(s, is); e = Math.max(e, ie); // giao nhau → mở rộng interval
+      }
+      if (!placed) out.push([s, e]);
+      list.length = 0;
+      for (const iv of out) list.push(iv);
+    }
+
+    // claim hole tiếp theo (ưu tiên từ đầu file để xem trước được)
+    claim(size) {
+      if (this.total == null) {
+        // chưa biết tổng dung lượng: chỉ 1 worker dẫn đầu với claim vô hạn + hint size
+        if (this.claimed.length || this.done.length) return null;
+        this.claimed.push([0, InfinityMarker]);
+        return { start: 0, end: InfinityMarker, size };
+      }
+      let cursor = 0;
+      const busy = [...this.done, ...this.claimed].sort((a, b) => a[0] - b[0]);
+      for (const [s, e] of busy) {
+        if (s > cursor) {
+          const end = Math.min(s, cursor + size, this.total);
+          if (end > cursor) {
+            this._insertInto(this.claimed, cursor, end);
+            return { start: cursor, end, size: end - cursor };
+          }
+        }
+        cursor = Math.max(cursor, e);
+      }
+      if (cursor < this.total) {
+        const end = Math.min(this.total, cursor + size);
+        this._insertInto(this.claimed, cursor, end);
+        return { start: cursor, end, size: end - cursor };
+      }
+      return null; // không còn hole chưa claim
+    }
+
+    // mark [start, start+covered) đã xong; phần claim còn thừa trả về cho
+    // worker hiện tại tự fetch tiếp (SW có thể trả ngắn hơn yêu cầu).
+    // QUAN TRỌNG: claim vô hạn (chưa biết total) chỉ "định fetch" đúng hint
+    // size — khi total đã biết, phần ngoài hint là hole TỰ DO cho worker khác,
+    // nếu không một worker sẽ ôm cả file và mất song song.
+    complete(claim, covered) {
+      const cs = claim.start, ce = claim.end;
+      const hint = (Number.isFinite(claim.size) && claim.size > 0) ? claim.size : 512 * 1024;
+      const effEnd = Number.isFinite(ce)
+        ? ce
+        : Math.min(cs + hint, this.total != null ? this.total : Infinity);
+      const doneEnd = cs + covered;
+      this._removeClaim(claim);
+      if (covered > 0) {
+        this._insertInto(this.done, cs, doneEnd);
+        this._received += covered;
+      }
+      if (doneEnd < effEnd) {
+        this._insertInto(this.claimed, doneEnd, effEnd);
+        const size = effEnd - doneEnd;
+        return { start: doneEnd, end: effEnd, size: size > 0 ? size : hint, partial: true };
+      }
+      return null;
+    }
+
+    // trả toàn bộ claim về làm hole (khi lỗi)
+    release(claim) {
+      this._removeClaim(claim);
+    }
+
+    _removeClaim(claim) {
+      const out = [];
+      for (const [s, e] of this.claimed) {
+        if (claim.start > s) out.push([s, Math.min(e, claim.start)]); // trừ phần claim bị bỏ
+        if (claim.end < e) out.push([Math.max(s, claim.end), e]);
+      }
+      this.claimed.length = 0;
+      for (const iv of out) {
+        if (iv[1] > iv[0]) this.claimed.push(iv);
+      }
+      this.claimed.sort((a, b) => a[0] - b[0]);
+    }
+
+    // có claim nào đang bay không (worker chờ khi hết hole nhưng chưa xong)
+    hasClaims() { return this.claimed.length > 0; }
+  }
+  const InfinityMarker = Infinity;
+
+  // ===========================================================================
+  // SECTION 8: NetBudget — budget byte in-flight (pattern dcBandwidthManager)
+  // ===========================================================================
+  const NetBudget = {
+    active: 0,
+    waiters: [],
+    async acquire(bytes) {
+      if (this.active + bytes <= NET_BUDGET_BYTES) { this.active += bytes; return; }
+      await new Promise((resolve) => { this.waiters.push({ resolve, bytes }); });
+    },
+    release(bytes) {
+      this.active = Math.max(0, this.active - bytes);
+      while (this.waiters.length && this.active + this.waiters[0].bytes <= NET_BUDGET_BYTES) {
+        const w = this.waiters.shift();
+        this.active += w.bytes;
+        w.resolve();
+      }
+    },
+  };
+
+  // ===========================================================================
+  // SECTION 9: Writers — đích ghi dữ liệu
+  // ===========================================================================
+  // FsWriter: FileSystemWritableFileStream ghi theo position → chunk về
+  // out-of-order vẫn đúng. Lỗi thì close() commit phần đã tải; Retry mở lại
+  // với keepExistingData:true và chỉ patch hole.
+  class FsWriter {
+    constructor(handle, opts = {}) {
+      this.handle = handle;
+      this.opts = opts;
+      this.writable = null;
+      this.closed = false;
+    }
+    static get supported() {
+      return typeof FileSystemFileHandle !== "undefined" &&
+        typeof FileSystemFileHandle.prototype.createWritable === "function";
+    }
+    async open(keepExisting = false) {
+      if (this.writable && !this.closed) return this.writable;
+      this.writable = await this.handle.createWritable(
+        keepExisting ? { keepExistingData: true } : {}
+      );
+      this.closed = false;
+      return this.writable;
+    }
+    async writeAt(position, data) {
+      const w = await this.open();
+      await w.write({ type: "write", position, data });
+    }
+    async close() {
+      if (this.writable && !this.closed) { await this.writable.close(); this.closed = true; }
+      this.writable = null;
+    }
+    async abort() {
+      if (this.writable && !this.closed) { try { await this.writable.abort(); } catch {} }
+      this.closed = true; this.writable = null;
+    }
+    get isClosed() { return this.closed || !this.writable; }
+  }
+
+  // MemWriter: gom chunk vào Map theo offset (browser không có FS Access)
+  class MemWriter {
+    constructor() { this.parts = new Map(); this._bytes = 0; }
+    async writeAt(position, data) { this.parts.set(position, data); this._bytes += data.byteLength; }
+    get bytes() { return this._bytes; }
+    get size() { return this.parts.size; }
+    assemble(mime) { // ghép Blob theo thứ tự offset
+      const offsets = [...this.parts.keys()].sort((a, b) => a - b);
+      return new Blob(offsets.map((o) => this.parts.get(o)), { type: mime || "application/octet-stream" });
+    }
+    async close() {}
+    async abort() { this.parts.clear(); this._bytes = 0; }
+    get isClosed() { return false; }
+  }
+
+  // ===========================================================================
+  // SECTION 10: Parallel Engine — lõi tải
+  // ===========================================================================
+  // Luồng task: (1) nguồn Blob đã capture → cắt song song 0 network;
+  // (2) nguồn HTTP (stream/ WebK, progressive/ WebA) → N worker kéo chunk
+  // 512KB-aligned, response 206 bị SW kẹp ngắn không sao — ledger tự thành hole;
+  // (3) không hỗ trợ Range (200 một phát) → worker đầu stream toàn bộ.
+
+  // --- gán class lỗi / error tagging ---
+  const tagError = (err, { retryable = false, fatal = false } = {}) => {
+    if (err && typeof err === "object") {
+      if (retryable) err.retryable = true;
+      if (fatal) err.fatal = true;
+    }
+    return err;
+  };
+  const isAbortLike = (err) =>
+    err?.name === "AbortError" || err?.name === "DOMException" && /abort/i.test(err?.message || "");
+
+  // mime "chấp nhận được" — SW WebA đôi khi trả octet-stream; thiếu Content-Type không coi là lỗi
+  const mimeAcceptable = (mime, kind) => {
+    if (!mime) return true;
+    if (!kind) return true;
+    if (mime.startsWith(`${kind}/`)) return true;
+    return mime === "application/octet-stream" || mime === "application/download";
+  };
+
+  // --- fetchChunk: 1 request Range + đọc stream + ghi writer ---
+  async function fetchChunk(task, claim) {
+    const { signal } = task.controller;
+    const ledger = task.ledger;
+    // span thực sự sẽ yêu cầu — luôn hữu hạn (claim vô hạn đi kèm hint size)
+    const reqSpan = (Number.isFinite(claim.size) && claim.size > 0)
+      ? Math.min(claim.size, CHUNK_MAX)
+      : CHUNK_MAX;
+    const reqEnd = claim.start + reqSpan - 1;
+
+    await NetBudget.acquire(reqSpan);
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort(signal.reason);
+    if (signal.aborted) relayAbort();
+    else signal.addEventListener("abort", relayAbort, { once: true });
+
+    let stallTimer = null;
+    const clearStall = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; } };
+    // Stall timeout 60s, reset khi có dữ liệu (pattern SENDER_TIMEOUT WebA)
+    const resetStall = () => {
+      clearStall();
+      stallTimer = setTimeout(
+        () => controller.abort(tagError(downloadError("errorStall", {}, "TimeoutError"), { retryable: true })),
+        STALL_TIMEOUT_MS
+      );
+    };
+
+    let reader = null;
+    let chunkReceived = 0; // byte đã đọc trong chunk này (đếm inflight)
+    try {
+      resetStall();
+      const res = await fetch(task.url, {
+        headers: { Range: `bytes=${claim.start}-${reqEnd}` },
         signal: controller.signal,
       });
-      if (res.status !== 200 && res.status !== 206) throw downloadError("errorHttp", { status: res.status });
-      const mime = res.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
-      if (!mime?.startsWith(`${kind}/`)) throw downloadError("errorMime", { kind, mime });
 
-      let expected, totalSize;
+      if (res.status !== 206 && res.status !== 200) {
+        const err = tagError(downloadError("errorHttp", { status: res.status }),
+          { retryable: res.status >= 500 || res.status === 429, fatal: !(res.status >= 500 || res.status === 429) });
+        throw err;
+      }
+
+      const mime = res.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() || "";
+      if (!mimeAcceptable(mime, task.kind)) {
+        throw tagError(downloadError("errorMime", { kind: task.kind, mime }), { fatal: true });
+      }
+
+      let expected = null; // byte kỳ vọng của response này
       if (res.status === 206) {
         const m = res.headers.get("Content-Range")?.match(CONTENT_RANGE_RE);
-        if (!m) throw downloadError("errorRangeMissing");
-        const [start, end, size] = m.slice(1).map(Number);
-        if (![start, end, size].every(Number.isSafeInteger) || start !== offset ||
-            end < start || size <= end || (total !== null && total !== size))
-          throw downloadError("errorRangeInconsistent");
-        expected = end - start + 1;
-        totalSize = size;
+        if (!m) throw tagError(downloadError("errorRangeMissing"), { fatal: true });
+        const crStart = +m[1], crEnd = +m[2];
+        const crTotal = m[3] === "*" ? null : +m[3];
+        if (crStart !== claim.start || crEnd < crStart) {
+          throw tagError(downloadError("errorRangeInconsistent"), { fatal: true });
+        }
+        if (crTotal != null && !Number.isSafeInteger(crTotal)) {
+          throw tagError(downloadError("errorRangeInconsistent"), { fatal: true });
+        }
+        expected = crEnd - crStart + 1;
+        if (expected > reqSpan + 1) { // SW trả nhiều hơn yêu cầu → dữ liệu lạ
+          throw tagError(downloadError("errorTooLarge"), { fatal: true });
+        }
+        if (crTotal != null) ledger.setTotal(crTotal); // có thể throw Inconsistent (fatal)
+        if (task.mime !== mime && mime) task.mime = mime;
       } else {
-        if (offset !== 0) throw downloadError("errorRangeUnsupported");
+        // 200: chỉ hợp lệ khi lấy từ offset 0 (blob: hoặc server không Range)
+        if (claim.start !== 0) {
+          throw tagError(downloadError("errorRangeUnsupported"), { fatal: true });
+        }
         const len = res.headers.get("Content-Length");
         if (len !== null && !res.headers.has("Content-Encoding")) {
-          if (!/^\d+$/.test(len) || !Number.isSafeInteger(Number(len))) throw downloadError("errorLength");
-          expected = Number(len); totalSize = expected;
+          if (!/^\d+$/.test(len) || !Number.isSafeInteger(Number(len))) {
+            throw tagError(downloadError("errorLength"), { fatal: true });
+          }
+          expected = Number(len);
+          ledger.setTotal(expected);
         }
+        if (mime) task.mime = mime;
       }
-      if (!res.body) throw downloadError("errorEmpty");
-      reader = res.body.getReader();
-      controller.signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true });
 
-      const chunks = [];
+      if (!res.body) throw tagError(downloadError("errorEmpty"), { fatal: true });
+      reader = res.body.getReader();
+      const onAbortCancel = () => { reader?.cancel().catch(() => {}); };
+      controller.signal.addEventListener("abort", onAbortCancel, { once: true });
+
+      const pieces = [];
       let received = 0;
-      opts.onProgress?.(offset, totalSize ?? null);
       while (true) {
-        checkAbort();
         const { value, done } = await reader.read();
-        checkAbort();
         if (done) break;
         received += value.byteLength;
-        if (expected !== undefined && received > expected) throw downloadError("errorTooLarge");
-        clearTimeout(timer);
-        if (opts.write) await opts.write(value);
-        else chunks.push(value);
-        checkAbort();
-        resetTimeout();
-        opts.onProgress?.(offset + received, totalSize ?? null);
+        chunkReceived = received;
+        if (expected != null && received > expected) {
+          throw tagError(downloadError("errorTooLarge"), { fatal: true });
+        }
+        task.meter.push(value.byteLength);
+        task.inflight = (task.inflight || 0) + value.byteLength;
+        resetStall();
+        pieces.push(value);
+        bumpProgress(task);
       }
-      if (!received || (expected !== undefined && received !== expected))
-        throw downloadError("errorIncomplete");
-      return {
-        blob: opts.write ? null : new Blob(chunks, { type: mime }),
-        mime, totalSize: totalSize ?? received, nextOffset: offset + received,
-      };
-    } catch (e) {
-      controller.abort(e);
-      throw controller.signal.reason || e;
+
+      if (received === 0) throw tagError(downloadError("errorEmpty"), { retryable: true });
+      // 200 không Content-Length → body là toàn bộ file
+      if (res.status === 200 && ledger.total == null) {
+        ledger.setTotal(received);
+      }
+
+      const data = pieces.length === 1 ? pieces[0] : concatU8(pieces); // ghi tại vị trí (out-of-order OK)
+      await task.writer.writeAt(claim.start, data);
+      return { covered: received, mime };
+    } catch (err) {
+      // stall-timer tự hủy request nội bộ (task-signal chưa hủy) → retryable;
+      // không nhầm với user-cancel trên browser cũ ném AbortError trần
+      if (!signal.aborted && controller.signal.aborted) {
+        throw tagError(controller.signal.reason || downloadError("errorStall", {}, "TimeoutError"), { retryable: true });
+      }
+      if (err instanceof TypeError) tagError(err, { retryable: true }); // lỗi mạng → retry (SW restart)
+      throw err;
     } finally {
-      clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", abort);
-      if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      clearStall();
+      signal.removeEventListener("abort", relayAbort);
+      if (reader) { await reader.cancel().catch(() => {}); reader = null; }
+      task.inflight = Math.max(0, (task.inflight || 0) - chunkReceived);
+      NetBudget.release(reqSpan);
+      bumpProgress(task);
     }
+  }
+
+  const concatU8 = (arrays) => {
+    let len = 0;
+    for (const a of arrays) len += a.byteLength;
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const a of arrays) { out.set(a, off); off += a.byteLength; }
+    return out;
   };
 
+  // --- đường Blob: cắt song song không qua network ---
+  async function downloadFromBlob(task, blob) {
+    const total = blob.size;
+    task.total = total;
+    task.mime = task.mime || blob.type || "";
+    task.ledger = null;
+    task.receivedDirect = 0; // reset cho retry không cộng dồn
+    const workers = Math.max(1, getConnections());
+    const sliceSize = 8 * MB;
+    let cursor = 0;
+
+    const worker = async () => {
+      while (true) {
+        if (task.controller.signal.aborted) throw task.controller.signal.reason;
+        if (task.pauseFlag) return;
+        const start = cursor; // chia phần kiểu offset += limit của WebA
+        cursor = Math.min(start + sliceSize, total);
+        if (start >= total) return;
+        const end = cursor;
+        const buf = new Uint8Array(await blob.slice(start, end).arrayBuffer());
+        task.meter.push(buf.byteLength);
+        task.receivedDirect = (task.receivedDirect || 0) + buf.byteLength;
+        await task.writer.writeAt(start, buf);
+        bumpProgress(task);
+      }
+    };
+    await Promise.all(Array.from({ length: workers }, worker));
+    task.receivedDirect = total;
+  }
+
+  // --- đường HTTP song song ---
+  async function parallelRangeDownload(task) {
+    const ledger = task.ledger || (task.ledger = new RangeLedger());
+    let chunkSize = task.chunkSize || CHUNK_DEFAULT; // giữ qua các lần retry/shrink
+    const isWebKStream = /\/stream\//.test(task.url);
+    let fullStreak = 0;
+
+    const worker = async () => {
+      let claim = null;
+      try {
+        while (true) {
+          if (task.controller.signal.aborted) throw task.controller.signal.reason;
+          if (task.pauseFlag) return;
+
+          if (!claim) {
+            claim = ledger.claim(chunkSize);
+            if (!claim) {
+              if (ledger.isComplete()) return;
+              if (ledger.hasClaims()) { await sleep(120, task.controller.signal); continue; }
+              return; // không còn việc (lỗi ở worker khác sẽ Promise.all throw)
+            }
+          }
+
+          let attempt = 0;
+          while (true) {
+            try {
+              const got = await fetchChunk(task, claim);
+              const wantFull = Number.isFinite(claim.end)
+                ? claim.end - claim.start
+                : got.covered;
+              const partial = ledger.complete(claim, got.covered);
+              bumpProgress(task);
+              // thích ứng: WebK stream/ đủ 4 chunk đầy liên tiếp → tăng 1MB
+              if (isWebKStream && got.covered >= wantFull) {
+                if (++fullStreak >= 4 && chunkSize < CHUNK_MAX) { chunkSize = CHUNK_MAX; }
+              } else fullStreak = 0;
+              task.chunkSize = chunkSize;
+              claim = partial || null;
+              break;
+            } catch (err) {
+              // pause/cancel chỉ khi CHÍNH task-signal bị hủy (stall-abort ở
+              // fetchChunk không đụng task-signal nên rơi xuống nhánh retry)
+              if (task.pauseFlag) { ledger.release(claim); throw PAUSE_SIGNAL; }
+              if (task.controller.signal.aborted) {
+                ledger.release(claim);
+                throw task.controller.signal.reason || err;
+              }
+              if (err?.fatal) { ledger.release(claim); throw err; }
+              attempt++;
+              if (attempt >= CHUNK_RETRIES) {
+                ledger.release(claim);
+                tagError(err, { retryable: true });
+                throw err;
+              }
+              if (err?.name === "TimeoutError") {
+                chunkSize = Math.max(CHUNK_MIN, chunkSize / 2); // timeout liên tiếp → thu nhỏ chunk
+                task.chunkSize = chunkSize;
+              }
+              await sleep(backoffDelay(attempt), task.controller.signal);
+              // giữ claim để retry đúng interval đó ngay
+            }
+          }
+        }
+      } catch (err) {
+        // một worker chết → hủy task-signal để siblings dừng ngay, không refetch
+        if (!task.pauseFlag && !task.controller.signal.aborted) {
+          try { task.controller.abort(err); } catch {}
+        }
+        throw err;
+      }
+    };
+
+    // Watchdog: không tiến bộ 120s → hủy (chống wait-loop treo vĩnh viễn)
+    let lastBytes = ledger.received, lastTs = Date.now();
+    const watchdog = setInterval(() => {
+      const cur = ledger.received + (task.inflight || 0);
+      if (cur > lastBytes) { lastBytes = cur; lastTs = Date.now(); return; }
+      if (Date.now() - lastTs > WATCHDOG_MS) {
+        task.controller.abort(tagError(new Error("watchdog: no progress"), { fatal: true }));
+      }
+    }, 5000);
+
+    try {
+      // N worker cùng vào: khi chưa biết total, claim() chỉ cho 1 worker dẫn
+      // đầu; các worker còn lại poll 120ms rồi tự tham gia khi total đã biết —
+      // đúng tinh thần noParallel của WebA cho byte đầu, song song ngay sau đó.
+      const n = Math.max(1, getConnections());
+      await Promise.all(Array.from({ length: n }, worker));
+    } finally {
+      clearInterval(watchdog);
+    }
+
+    if (!ledger.isComplete()) {
+      throw tagError(downloadError("errorIncomplete"), { retryable: true });
+    }
+  }
+
+  // "cờ" nội bộ báo pause — không phải lỗi thật
+  const PAUSE_SIGNAL = Object.assign(new Error("paused"), { name: "PauseSignal", pause: true });
+
+  // --- điều phối engine theo loại nguồn ---
+  async function engineDownload(task) {
+    const blobObj = task.url.startsWith("blob:") ? BlobRegistry.get(task.url) : null;
+    if (blobObj instanceof Blob) {
+      log.info(`blob fast-path (${formatBytes(blobObj.size)})`, task.fileName);
+      await downloadFromBlob(task, blobObj);
+      return;
+    }
+    await parallelRangeDownload(task);
+  }
+
+  // --- progress hiển thị (throttle 50ms kiểu tweb) ---
+  function bumpProgress(task) {
+    if (task.ledger) {
+      task.received = task.ledger.received + (task.inflight || 0);
+      if (task.ledger.total != null) task.total = task.ledger.total;
+    } else if (task.receivedDirect != null) {
+      task.received = task.receivedDirect;
+      if (task.total == null) task.total = task.received;
+    }
+    const speed = task.meter?.speed() || 0;
+    task.speed = speed;
+    task.eta = (speed > 0 && task.total) ? (task.total - task.received) / speed : null;
+    throttledRender(task);
+  }
+
+  // ===========================================================================
+  // SECTION 11: metadata + đặt tên / naming & metadata
+  // ===========================================================================
   const hashCode = (s) => {
     let h = 0, l = s.length, i = 0;
     while (i < l) h = ((h << 5) - h + s.charCodeAt(i++)) | 0;
     return h >>> 0;
   };
+
+  // WebK stream/: URL dạng `stream/` + encodeURIComponent(JSON(DownloadOptions))
+  // (helpers/fileName.ts getFileURL của tweb) — bung ra có location.id, mimeType, fileName
   const getMediaMetadata = (url) => {
-    try { return JSON.parse(decodeURIComponent(url.split("/").pop())); } catch { return {}; }
+    try {
+      const last = url.split("?")[0].split("/").pop();
+      return JSON.parse(decodeURIComponent(last));
+    } catch { return {}; }
   };
 
-  // stable identity of a media file across re-renders. tweb's stream/photo URLs are
-  // `type/` + JSON(DownloadOptions) whose `location.id` is the file id (helpers/fileName.ts getFileURL);
-  // blob: URLs change on every render, so fall back to the message id tweb puts on the bubble /
-  // album item (bubbles.ts data-mid + data-peer-id).
+  // Nhận diện media qua URL, ưu tiên file id bền vững (không đổi theo re-render)
+  const WEBA_HASH_RE = /\/(?:progressive|download)\/((?:document|photo)\d+)/;
   const mediaKey = (url, el) => {
-    const loc = getMediaMetadata(url)?.location;
+    const u = url || "";
+    const weba = u.match(WEBA_HASH_RE);
+    if (weba) return `file:${weba[1]}`;
+    const loc = getMediaMetadata(u)?.location;
     if (loc?.id) return `file:${loc.id}`;
     const midEl = el?.closest?.("[data-mid]");
     if (midEl?.dataset.mid) {
       const peer = midEl.closest("[data-peer-id]")?.dataset.peerId || "";
       return `msg:${peer}:${midEl.dataset.mid}`;
     }
-    // webA (telegram-tt): album media carry id="album-media-message-<id>[-<index>]" (Album.tsx),
-    // the message root carries data-message-id (Message.tsx); the chat id lives in the URL hash
+    // webA album/message DOM ids (Album.tsx / Message.tsx)
     const albumId = el?.closest?.("[id^='album-media-']")?.id;
     const msgId = el?.closest?.("[data-message-id]")?.dataset.messageId;
     if (albumId || msgId) return `msg:${location.hash.slice(1)}:${albumId || msgId}`;
-    return `url:${url}`;
+    return `url:${u}`;
   };
 
-  // remembers what was already saved so batch / auto-queue don't fetch it again on later visits
-  const DOWNLOADED_CAP = 5000;
-  let downloadedKeys = new Set(loadStore("downloaded", []));
+  let downloadedKeys = new Set(TEST_MODE ? [] : loadStore("downloaded", []));
   const markDownloaded = (key) => {
-    if (!key || key.startsWith("url:")) return; // blob urls die with the page, not worth remembering
+    if (!key || key.startsWith("url:")) return; // blob url chết theo trang
     downloadedKeys.delete(key);
     downloadedKeys.add(key);
-    if (downloadedKeys.size > DOWNLOADED_CAP) downloadedKeys = new Set([...downloadedKeys].slice(-DOWNLOADED_CAP));
+    if (downloadedKeys.size > DOWNLOADED_CAP) {
+      downloadedKeys = new Set([...downloadedKeys].slice(-DOWNLOADED_CAP));
+    }
     saveStore("downloaded", [...downloadedKeys]);
   };
+
   const EXT_MAP = {
     "video/mp4": ["mp4", "m4v"], "video/webm": ["webm"], "video/quicktime": ["mov"],
     "video/x-matroska": ["mkv"], "audio/ogg": ["ogg", "oga", "opus"], "audio/mpeg": ["mp3"],
@@ -338,16 +962,22 @@
     "image/gif": ["gif"], "image/avif": ["avif"], "image/heic": ["heic"],
     "image/bmp": ["bmp"], "image/svg+xml": ["svg"],
   };
+  const sanitizeName = (s) => (s || "").replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_");
   const getDownloadFileName = (url, mime, kind) => {
     const meta = getMediaMetadata(url);
     let name = typeof meta?.fileName === "string" ? meta.fileName : "";
+    if (!name) {
+      // WebA progressive: document123 → dùng làm tên gốc tạm
+      const weba = (url || "").match(WEBA_HASH_RE);
+      if (weba) name = weba[1];
+    }
     if (!name) {
       try {
         const base = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop());
         if (/\.[a-z0-9]{2,5}$/i.test(base)) name = base;
       } catch {}
     }
-    name = (name || hashCode(url).toString(36)).replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_");
+    name = sanitizeName(name || hashCode(url).toString(36));
     const allowed = EXT_MAP[mime?.toLowerCase()] ||
       (mime ? null : (kind === "video" ? ["mp4"] : kind === "audio" ? ["ogg"] : ["jpg"]));
     const dot = name.lastIndexOf(".");
@@ -355,61 +985,33 @@
     if (dot > 0 && allowed.includes(name.slice(dot + 1).toLowerCase())) return name;
     return (dot > 0 ? name.slice(0, dot) : name) + "." + allowed[0];
   };
-  // chrome rate-limits anchor-click downloads at ~10 concurrent; serialize + 400ms gap so a 59-file batch
-  // doesn't trip "This site is trying to download multiple files" throttle and drop items silently.
-  let saveChain = Promise.resolve();
-  const saveMediaBlob = (blob, fileName) => {
-    const run = () => new Promise((res) => {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = fileName;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => { URL.revokeObjectURL(url); res(); }, 400);
-    });
-    saveChain = saveChain.then(run, run);
-    return saveChain;
+
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const pad3 = (n) => String(n).padStart(3, "0");
+  const nowStamp = () => {
+    const d = new Date();
+    return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  };
+  const applyNaming = (originalName) => {
+    const dot = originalName.lastIndexOf(".");
+    const base = dot > 0 ? originalName.slice(0, dot) : originalName;
+    const ext = dot > 0 ? originalName.slice(dot) : "";
+    const prefix = settings.prefix ? sanitizeName(settings.prefix) + "_" : "";
+    switch (settings.naming) {
+      case "date": return prefix + nowStamp() + ext;
+      case "seq": { const out = prefix + pad3(seqCounter++) + ext; saveStore("seq", seqCounter); return out; }
+      case "date_original": return prefix + nowStamp() + "_" + base + ext;
+      case "seq_original": { const out = prefix + pad3(seqCounter++) + "_" + base + ext; saveStore("seq", seqCounter); return out; }
+      default: return prefix + base + ext;
+    }
   };
 
-  // ===== settings: file naming + destination folder =========================
-  const DEFAULT_SETTINGS = { naming: "original", prefix: "", subfolder: "none" };
-  let settings = Object.assign({}, DEFAULT_SETTINGS, loadStore("settings", {}));
-  let seqCounter = loadStore("seq", 1);
-
-  const openIDB = () => new Promise((res, rej) => {
-    const r = indexedDB.open("sakerly", 1);
-    r.onupgradeneeded = () => r.result.createObjectStore("kv");
-    r.onsuccess = () => res(r.result);
-    r.onerror = () => rej(r.error);
-  });
-  const idbGet = async (k) => {
-    try { const db = await openIDB();
-      return await new Promise((res) => {
-        const tx = db.transaction("kv").objectStore("kv").get(k);
-        tx.onsuccess = () => res(tx.result); tx.onerror = () => res(null);
-      });
-    } catch { return null; }
-  };
-  const idbSet = async (k, v) => {
-    try { const db = await openIDB();
-      await new Promise((res) => {
-        const tx = db.transaction("kv", "readwrite").objectStore("kv").put(v, k);
-        tx.onsuccess = () => res(); tx.onerror = () => res();
-      });
-    } catch {}
-  };
-  const idbDel = async (k) => {
-    try { const db = await openIDB();
-      await new Promise((res) => {
-        const tx = db.transaction("kv", "readwrite").objectStore("kv").delete(k);
-        tx.onsuccess = () => res(); tx.onerror = () => res();
-      });
-    } catch {}
-  };
-
+  // ===========================================================================
+  // SECTION 12: thư mục lưu / destination folder
+  // ===========================================================================
   let destDirHandle = null;
-  let destDirName = loadStore("destDirName", "");
-  // handle restored lazily; needs user gesture to re-request permission on first write.
-  idbGet("destDirHandle").then((h) => { if (h) destDirHandle = h; });
+  let destDirName = TEST_MODE ? "" : loadStore("destDirName", "");
+  if (!TEST_MODE) idbGet("destDirHandle").then((h) => { if (h) destDirHandle = h; });
 
   const ensureDirPermission = async (handle) => {
     if (!handle) return false;
@@ -419,15 +1021,6 @@
     catch { return false; }
   };
 
-  const pad2 = (n) => String(n).padStart(2, "0");
-  const pad3 = (n) => String(n).padStart(3, "0");
-  const nowStamp = () => {
-    const d = new Date();
-    return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-  };
-  // peer/channel title from the open chat header. tweb puts it in `.chat .user-title` (with .peer-title inside);
-  // falls back to document.title stripped of the "Telegram" suffix if the DOM selector misses.
-  const sanitizeSegment = (s) => (s || "").replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_").trim().slice(0, 80);
   const todaySegment = () => {
     const d = new Date();
     return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -435,9 +1028,9 @@
   const currentChannelName = () => {
     const el = document.querySelector(".chat .user-title, .chat-info .user-title, .chat-utils ~ * .user-title");
     const direct = el?.querySelector(".peer-title")?.textContent || el?.textContent;
-    if (direct && direct.trim()) return sanitizeSegment(direct);
-    const t = (document.title || "").replace(/\s*[-·]?\s*Telegram\s*$/i, "").trim();
-    return sanitizeSegment(t) || "Unknown";
+    if (direct && direct.trim()) return sanitizeName(direct).trim().slice(0, 80);
+    const title = (document.title || "").replace(/\s*[-·]?\s*Telegram\s*$/i, "").trim();
+    return sanitizeName(title).slice(0, 80) || "Unknown";
   };
   const subfolderSegments = () => {
     switch (settings.subfolder) {
@@ -448,7 +1041,6 @@
       default: return [];
     }
   };
-  // walk/create the chain of subfolders under the user-picked root; each segment opens with { create: true }
   const resolveDestDir = async () => {
     if (!destDirHandle) return null;
     if (!await ensureDirPermission(destDirHandle)) return null;
@@ -460,212 +1052,7 @@
     }
     return dir;
   };
-
-  const applyNaming = (originalName) => {
-    const dot = originalName.lastIndexOf(".");
-    const base = dot > 0 ? originalName.slice(0, dot) : originalName;
-    const ext = dot > 0 ? originalName.slice(dot) : "";
-    const prefix = settings.prefix ? settings.prefix.replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, "_") + "_" : "";
-    let out;
-    switch (settings.naming) {
-      case "date": out = prefix + nowStamp() + ext; break;
-      case "seq": out = prefix + pad3(seqCounter++) + ext; saveStore("seq", seqCounter); break;
-      case "date_original": out = prefix + nowStamp() + "_" + base + ext; break;
-      case "seq_original": out = prefix + pad3(seqCounter++) + "_" + base + ext; saveStore("seq", seqCounter); break;
-      default: out = prefix + base + ext;
-    }
-    return out;
-  };
-
-  // ===== task queue + concurrency ===========================================
-  const downloadTasks = new Map();
-  const activeDownloads = new Map();
-  const downloadQueue = [];
-  const MAX_CONCURRENT = 2;
-  let runningCount = 0;
-
-  const formatBytes = (bytes) => {
-    const u = ["B", "KB", "MB", "GB", "TB"];
-    const i = Math.min(Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)), u.length - 1);
-    return `${(i ? decFmt() : intFmt()).format(bytes / 1024 ** i)} ${u[i]}`;
-  };
-
-  const updatePanel = () => {
-    const panel = document.getElementById("sakerly-panel");
-    if (!panel) return;
-    const hasTasks = !!panel.querySelector(".sakerly-task");
-    panel.classList.toggle("empty", !hasTasks);
-    panel.querySelector(".sakerly-panel-title").textContent = activeDownloads.size
-      ? t("downloadsCount", { count: intFmt().format(activeDownloads.size) })
-      : t("downloads");
-  };
-  const dismissTask = (task) => {
-    document.getElementById("sakerly-task-" + task.id)?.remove();
-    if (task.finished) downloadTasks.delete(task.id);
-    updatePanel();
-  };
-  const showTask = (task) => {
-    const panel = document.getElementById("sakerly-panel");
-    const list = panel.querySelector(".sakerly-task-list");
-    panel.classList.remove("collapsed");
-    const toggle = panel.querySelector(".sakerly-panel-toggle");
-    toggle.textContent = "–"; toggle.title = t("hide");
-    let card = document.getElementById("sakerly-task-" + task.id);
-    if (!card) {
-      card = document.createElement("div");
-      card.id = "sakerly-task-" + task.id;
-      card.className = "sakerly-task";
-      card.innerHTML = `
-        <div class="sakerly-task-head">
-          <p class="filename" dir="auto"></p>
-          <button type="button" data-act="dismiss" title="×">&times;</button>
-        </div>
-        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-          <div class="progress-fill"></div>
-          <p class="progress-label"></p>
-        </div>
-        <p class="sakerly-task-details"></p>
-        <p class="sakerly-task-error"></p>
-        <div class="sakerly-task-actions">
-          <button type="button" data-act="cancel"></button>
-          <button type="button" data-act="retry" hidden></button>
-        </div>`;
-      card.querySelector('[data-act="dismiss"]').onclick = () => dismissTask(task);
-      card.querySelector('[data-act="cancel"]').onclick = () => {
-        if (task.finished || task.state === "saving") return;
-        task.controller.abort(new DOMException("Download cancelled", "AbortError"));
-        if (!task.running) finishTask(task, "cancelled");
-      };
-      card.querySelector('[data-act="retry"]').onclick = () => {
-        dismissTask(task);
-        downloadMedia(task.url, task.kind, { mediaKey: task.mediaKey });
-      };
-      list.prepend(card);
-    }
-    renderTask(task);
-    return card;
-  };
-  const renderTask = (task) => {
-    const card = document.getElementById("sakerly-task-" + task.id);
-    if (!card) return;
-    card.dataset.state = task.state;
-    const label = t(task.state);
-    const title = card.querySelector(".filename");
-    title.textContent = task.fileName; title.title = task.fileName;
-    const progress = card.querySelector(".progress");
-    progress.setAttribute("aria-label", t("progress"));
-    const pct = task.total ? Math.min(100, Math.floor(task.received * 100 / task.total)) : null;
-    progress.classList.toggle("indeterminate", task.state === "downloading" && pct === null);
-    if (pct === null) progress.removeAttribute("aria-valuenow");
-    else progress.setAttribute("aria-valuenow", pct);
-    progress.querySelector(".progress-fill").style.width = (pct ?? 0) + "%";
-    progress.querySelector(".progress-label").textContent =
-      task.state === "downloading" && pct !== null ? `${intFmt().format(pct)}%` : label;
-    const speed = task.received / Math.max((performance.now() - task.startedAt) / 1000, 0.1);
-    card.querySelector(".sakerly-task-details").textContent =
-      formatBytes(task.received) + (task.total !== null ? ` / ${formatBytes(task.total)}` : "") +
-      (task.state === "downloading" && task.received ? ` · ${t("rate", { speed: formatBytes(speed) })}` : "");
-    const err = card.querySelector(".sakerly-task-error");
-    err.textContent = formatError(task.error); err.hidden = !task.error;
-    const cancel = card.querySelector('[data-act="cancel"]');
-    cancel.textContent = t("cancel"); cancel.hidden = task.finished;
-    cancel.disabled = task.state === "saving";
-    const retry = card.querySelector('[data-act="retry"]');
-    retry.textContent = t("retry");
-    retry.hidden = !["failed", "cancelled"].includes(task.state);
-    task.renderedAt = performance.now();
-    task.renderedBytes = task.received;
-    updatePanel();
-  };
-  const finishTask = (task, state, error) => {
-    if (task.finished) return;
-    task.finished = true;
-    clearTimeout(task.progressTimer);
-    task.state = state; task.error = error;
-    if (activeDownloads.get(task.key) === task) activeDownloads.delete(task.key);
-    if (state === "completed" || state === "handedOff") markDownloaded(task.mediaKey);
-    if (error) log.error(error.message || error, task.fileName);
-    renderTask(task);
-    updatePanel();
-    task.resolve({ state, fileName: task.fileName, received: task.received });
-  };
-  const runTask = async (task) => {
-    const parts = [];
-    let writable;
-    const checkCancelled = () => {
-      if (task.controller.signal.aborted) throw task.controller.signal.reason;
-    };
-    try {
-      checkCancelled();
-      task.state = "preparing"; renderTask(task);
-      if (task.handle) writable = await task.handle.createWritable();
-      checkCancelled();
-      task.state = "downloading";
-      task.startedAt = performance.now();
-      renderTask(task);
-      let offset = 0, total = null, mime;
-      do {
-        const part = await fetchMediaPart(task.url, offset, total, task.kind, {
-          signal: task.controller.signal,
-          write: writable ? (c) => writable.write(c) : undefined,
-          onProgress: (received, size) => {
-            task.received = received; task.total = size;
-            if ((!task.renderedBytes && received) ||
-                performance.now() - task.renderedAt >= 100 || received === size) {
-              renderTask(task);
-            } else if (!task.progressTimer) {
-              task.progressTimer = setTimeout(() => {
-                task.progressTimer = null; renderTask(task);
-              }, 100);
-            }
-          },
-        });
-        checkCancelled();
-        if (!writable) parts.push(part.blob);
-        offset = part.nextOffset; total = part.totalSize; mime = part.mime;
-        task.fileName = getDownloadFileName(task.url, mime, task.kind);
-        task.received = offset; task.total = total; renderTask(task);
-      } while (offset < total);
-      checkCancelled();
-      task.state = "saving"; renderTask(task);
-      // original name (from TG metadata/url) decided above; apply user naming format for the final file
-      task.fileName = applyNaming(task.fileName);
-      renderTask(task);
-      if (writable) await writable.close();
-      else {
-        const targetDir = await resolveDestDir();
-        if (targetDir) {
-          const { fh, name } = await uniqueFileHandle(targetDir, task.fileName);
-          task.fileName = name;
-          const w = await fh.createWritable();
-          await w.write(new Blob(parts, { type: mime }));
-          await w.close();
-        } else await saveMediaBlob(new Blob(parts, { type: mime }), task.fileName);
-      }
-      finishTask(task, writable ? "completed" : "handedOff");
-    } catch (error) {
-      if (writable) { try { await writable.abort(); } catch {} }
-      if (task.controller.signal.aborted || error?.name === "AbortError") finishTask(task, "cancelled");
-      else finishTask(task, "failed", error);
-    } finally {
-      parts.length = 0;
-      task.handle = null;
-    }
-  };
-  const pumpQueue = () => {
-    while (runningCount < MAX_CONCURRENT && downloadQueue.length) {
-      const task = downloadQueue.shift();
-      if (task.finished) continue;
-      runningCount++;
-      task.running = true;
-      runTask(task).finally(() => {
-        task.running = false;
-        runningCount--;
-        pumpQueue();
-      });
-    }
-  };
-  // never overwrite a file already in the folder: "a.jpg" → "a (1).jpg" → "a (2).jpg"
+  // không bao giờ ghi đè file có sẵn: a.jpg → a (1).jpg → a (2).jpg (v1)
   const uniqueFileHandle = async (dir, name) => {
     const dot = name.lastIndexOf(".");
     const base = dot > 0 ? name.slice(0, dot) : name;
@@ -682,51 +1069,285 @@
     throw new Error(`too many files named ${name}`);
   };
 
-  // opts.mediaKey: precomputed identity (from the DOM element); opts.skipDownloaded: batch/auto paths
-  // skip media already saved before. returns { state: "skipped" } in that case.
+  // anchor-click tuần tự + cách 400ms — tránh Chrome chặn "multiple downloads".
+  // hrefOverride: dùng URL SW (download/ WebA) thay vì blob — browser tự stream.
+  let saveChain = Promise.resolve();
+  const saveMediaBlob = (blob, fileName, hrefOverride) => {
+    const run = () => new Promise((res) => {
+      const url = hrefOverride || URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = fileName || "";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => { if (!hrefOverride) URL.revokeObjectURL(url); res(); }, 400);
+    });
+    saveChain = saveChain.then(run, run);
+    return saveChain;
+  };
+
+  // WebA native fallback: đổi `progressive/` → `download/` — SW stream 200 với
+  // Content-Disposition: attachment, browser tự lưu xuống disk (0 RAM, mọi browser)
+  const webaDownloadFallback = (url, fileName) => {
+    try {
+      const u = new URL(url, location.href);
+      const idx = u.pathname.indexOf("/progressive/");
+      if (idx < 0) return null;
+      const hash = u.pathname.slice(idx + "/progressive/".length);
+      if (!/^((document|photo)\d+)/.test(hash)) return null;
+      u.pathname = u.pathname.slice(0, idx) + "/download/" + hash;
+      if (!u.searchParams.has("download")) u.searchParams.set("download", "1");
+      if (fileName) u.searchParams.set("filename", sanitizeName(fileName).slice(0, 120));
+      return u.href;
+    } catch { return null; }
+  };
+
+  // ===========================================================================
+  // SECTION 13: LazyWriter + task manager
+  // ===========================================================================
+  // Writer "lười": đợi chunk đầu về (biết mime + tên đúng) mới tạo file thật,
+  // rồi ủy cho FsWriter hoặc MemWriter.
+  class LazyWriter {
+    constructor(task) { this.task = task; this.inner = null; }
+    async _ensure() {
+      if (this.inner) return this.inner;
+      const task = this.task;
+      if (task.handle) {
+        this.inner = FsWriter.supported ? new FsWriter(task.handle) : new MemWriter();
+      } else {
+        const dir = await resolveDestDir();
+        if (dir && FsWriter.supported) {
+          task.fileName = applyNaming(task.fileName);
+          const { fh, name } = await uniqueFileHandle(dir, task.fileName);
+          task.fileName = name;
+          task._createdFile = fh;
+          this.inner = new FsWriter(fh);
+        } else if (task.total > 1200 * MB && (task.url || "").includes("/progressive/")) {
+          // file quá lớn nhưng không có FS Access (Firefox...) → WebA native
+          // handoff: SW stream 200 xuống disk thẳng, không tốn RAM
+          const fb = webaDownloadFallback(task.url, task.fileName);
+          if (fb) throw Object.assign(new Error("large file, no disk writer"), { handoffUrl: fb, handoff: true, fatal: true });
+          this.inner = new MemWriter();
+        } else {
+          this.inner = new MemWriter();
+        }
+      }
+      await this.inner.open(task.resumeMode === true);
+      return this.inner;
+    }
+    async writeAt(position, data) { return (await this._ensure()).writeAt(position, data); }
+    async open(keepExisting = false) {
+      if (this.inner) await this.inner.open(keepExisting);
+    }
+    async close() { await this.inner?.close(); }
+    async abort() { await this.inner?.abort(); }
+    async discardCreatedFile() {
+      try { await this.task._createdFile?.remove?.(); } catch {} // hủy task → xóa file rỗng đã tạo
+      this.task._createdFile = null;
+    }
+    get real() { return this.inner; }
+  }
+
+  const downloadTasks = new Map();
+  const activeTasks = new Map(); // key → task (dedupe in-flight theo key + URL)
+  const waitingQueue = [];
+  let runningCount = 0;
+
+  let renderTask = () => {}; // UI gắn vào sau
+  let updatePanelCounts = () => {};
+
+  const throttledRender = (task) => {
+    const now = performance.now();
+    if (now - (task._renderedAt || 0) >= 50) { task._renderedAt = now; renderTask(task); }
+    else if (!task._renderTimer) {
+      task._renderTimer = setTimeout(() => {
+        task._renderTimer = null; task._renderedAt = performance.now(); renderTask(task);
+      }, 50);
+    }
+  };
+
+  const finishTask = (task, state, error) => {
+    if (task.finished) return;
+    task.finished = true;
+    clearTimeout(task._renderTimer);
+    task.state = state; task.error = error;
+    task.speed = 0; task.eta = null;
+    if (activeTasks.get(task.key) === task) activeTasks.delete(task.key);
+    if (state === "completed" || state === "handedOff") markDownloaded(task.mediaKey);
+    if (error) log.error(error.message || String(error), task.fileName);
+    renderTask(task);
+    updatePanelCounts();
+    task.resolve({ state, fileName: task.fileName, received: task.received });
+  };
+
+  const runTask = async (task) => {
+    if (task.running) return; // chống double-run do queue trùng / guard re-entry
+    task.running = true;
+    try {
+      if (!task.writer) task.writer = new LazyWriter(task);
+      if (task.controller.signal.aborted) throw task.controller.signal.reason;
+
+      task.state = "preparing"; renderTask(task);
+      await task.writer.open(task.resumeMode === true); // resume: mở lại writer giữ dữ liệu cũ
+      if (task.resumeMode) {
+        log.info(`resume từ ${formatBytes(task.ledger?.received || 0)}`, task.fileName);
+        task.resumeMode = false;
+      }
+      if (task.controller.signal.aborted) throw task.controller.signal.reason;
+
+      task.state = "downloading"; task.startedAt = performance.now(); renderTask(task);
+      await engineDownload(task);
+      if (task.controller.signal.aborted) throw task.controller.signal.reason;
+
+      // --- finalize --------------------------------------------------------
+      task.state = "saving"; renderTask(task);
+      const real = task.writer.real;
+      if (real instanceof FsWriter) {
+        await real.close(); // commit temp → file thật
+        finishTask(task, "completed");
+      } else {
+        // mime đã biết chắc sau chunk cuối → tính lại đuôi file trước khi đặt tên
+        task.fileName = applyNaming(getDownloadFileName(task.url, task.mime, task.kind));
+        renderTask(task);
+        const blob = real.assemble(task.mime);
+        const dir = await resolveDestDir();
+        if (dir && FsWriter.supported) {
+          const { fh, name } = await uniqueFileHandle(dir, task.fileName); // hiếm: LazyWriter không tạo được FsWriter lúc đầu
+          task.fileName = name;
+          const w = await fh.createWritable();
+          await w.write(blob); await w.close();
+          finishTask(task, "completed");
+        } else {
+          await saveMediaBlob(blob, task.fileName);
+          finishTask(task, "handedOff");
+        }
+      }
+    } catch (err) {
+      if (task.pauseFlag) {
+        task.state = "paused"; task.speed = 0; task.eta = null;
+        renderTask(task);
+        return;
+      }
+      // chỉ coi là "cancelled" khi user chủ động hủy (cancelRequested) hoặc
+      // task-signal hủy với lý do AbortError — stall/Watchdog hủy inner-signal thôi
+      const signalReason = task.controller.signal?.reason;
+      if (task.cancelRequested || isAbortLike(signalReason)) {
+        await task.writer?.abort();
+        await task.writer?.discardCreatedFile?.();
+        finishTask(task, "cancelled");
+        return;
+      }
+      // handoff sang browser cho file lớn không có disk-writer (Firefox + WebA)
+      if (err?.handoff && err.handoffUrl) {
+        log.warn("handing off to native download endpoint (large file, no FS Access)", task.fileName);
+        task.usedNativeFallback = true;
+        try {
+          await saveMediaBlob(null, applyNaming(task.fileName), err.handoffUrl);
+          finishTask(task, "handedOff");
+          return;
+        } catch (e) { log.error("native handoff failed: " + e.message); }
+      }
+      // Auto-retry task 1 lần với lỗi retryable (network blip / SW restart).
+      // Engine hủy task-signal kèm lỗi khi worker chết → cấp controller mới
+      // (giữ nguyên cancelRequested/pauseFlag làm dấu hiệu ý muốn người dùng).
+      if (err?.retryable && !err.fatal && !task.pauseFlag && !task.cancelRequested &&
+          (task.autoRetries || 0) < TASK_AUTO_RETRY_MAX) {
+        task.autoRetries = (task.autoRetries || 0) + 1;
+        task.controller = new AbortController();
+        log.warn(`task retry ${task.autoRetries}/${TASK_AUTO_RETRY_MAX}: ${err.message}`, task.fileName);
+        try { await sleep(TASK_AUTO_RETRY_DELAY, task.controller.signal); } catch { /* aborted */ }
+        if (!task.pauseFlag && !task.controller.signal.aborted) {
+          task.running = false;
+          return runTask(task);
+        }
+        if (task.pauseFlag) {
+          task.controller = new AbortController();
+          task.state = "paused"; renderTask(task);
+          return;
+        }
+        await task.writer?.abort(); await task.writer?.discardCreatedFile?.();
+        finishTask(task, "cancelled");
+        return;
+      }
+      // commit phần đã tải để Retry tiếp tục (resume trong phiên)
+      if (task.writer) { try { await task.writer.close(); } catch {} }
+      // WebA: fallback native download/ (browser stream, không tốn RAM)
+      if (!task.usedNativeFallback) {
+        const fb = webaDownloadFallback(task.url, applyNaming(task.fileName));
+        if (fb) {
+          task.usedNativeFallback = true;
+          log.warn("falling back to native download endpoint", task.fileName);
+          try {
+            await saveMediaBlob(null, task.fileName, fb);
+            finishTask(task, "handedOff");
+            return;
+          } catch (e) { log.error("native fallback failed: " + e.message); }
+        }
+      }
+      finishTask(task, "failed", err);
+    } finally {
+      task.running = false;
+    }
+  };
+
+  const pumpQueue = () => {
+    while (runningCount < MAX_ACTIVE_TASKS && waitingQueue.length) {
+      const task = waitingQueue.shift();
+      if (task.finished || task.pauseFlag || task.running) continue;
+      runningCount++;
+      runTask(task).finally(() => { runningCount--; pumpQueue(); });
+    }
+  };
+
   const downloadMedia = (url, kind, opts = {}) => {
     if (typeof url !== "string" || !url) return Promise.resolve();
     const mk = opts.mediaKey || mediaKey(url);
     if (opts.skipDownloaded && downloadedKeys.has(mk)) return Promise.resolve({ state: "skipped" });
-    // in-flight dedupe by media identity, not URL — the same file under a fresh blob URL is still the same file
     const key = `${kind}:${mk}`;
-    const existing = activeDownloads.get(key);
-    if (existing) {
-      if (!opts.silent) {
-        const card = showTask(existing);
-        card.scrollIntoView({ block: "nearest" });
-      }
+    const existing = activeTasks.get(key);
+    if (existing && !existing.finished) {
+      if (!opts.silent) renderTask(existing, true); // scroll tới card
       return existing.promise;
     }
-    if (downloadTasks.size >= 20) {
+    // dedupe theo URL: cùng nguồn xếp hàng qua key khác (viewer vs chat) vẫn là
+    // MỘT file — trả về task đang chạy thay vì tạo bản sao trùng lặp
+    for (const t of activeTasks.values()) {
+      if (!t.finished && t.url === url) {
+        if (!opts.silent) renderTask(t, true);
+        return t.promise;
+      }
+    }
+    if (downloadTasks.size >= 30) {
       for (const prev of downloadTasks.values()) {
-        if (downloadTasks.size < 20) break;
-        if (prev.finished) dismissTask(prev);
+        if (downloadTasks.size < 30) break;
+        if (prev.finished) {
+          document.getElementById("sk-task-" + prev.id)?.remove(); // dọn card, tránh card mồ côi
+          downloadTasks.delete(prev.id);
+        }
       }
     }
     const task = {
       id: Math.random().toString(36).slice(2) + Date.now().toString(36),
       key, url, kind, mediaKey: mk,
       fileName: getDownloadFileName(url, getMediaMetadata(url)?.mimeType, kind),
-      state: "preparing", received: 0, total: null,
+      state: "preparing", received: 0, total: null, speed: 0, eta: null, inflight: 0,
       controller: new AbortController(),
-      startedAt: performance.now(), renderedAt: 0, finished: false,
+      meter: new SpeedMeter(),
+      startedAt: performance.now(), finished: false,
+      pauseFlag: false, cancelRequested: false,
     };
     task.promise = new Promise((r) => (task.resolve = r));
     downloadTasks.set(task.id, task);
-    activeDownloads.set(key, task);
-    showTask(task);
+    activeTasks.set(key, task);
+    renderTask(task, true); // tạo card
     const enqueue = (handle) => {
       if (task.finished) return;
-      task.handle = handle;
+      task.handle = handle || null;
       task.state = "queued";
       renderTask(task);
-      downloadQueue.push(task);
+      waitingQueue.push(task);
       pumpQueue();
     };
     try {
       const pw = typeof unsafeWindow === "undefined" ? window : unsafeWindow;
-      // skip the save-file dialog when a destination folder is already set — write straight into it
       if (!opts.batch && !destDirHandle && kind !== "image" &&
           typeof pw.showSaveFilePicker === "function" && pw.self === pw.top) {
         Promise.resolve(pw.showSaveFilePicker({ suggestedName: task.fileName }))
@@ -739,27 +1360,847 @@
     return task.promise;
   };
 
-  // ===== media source accessors =============================================
+  // --- điều khiển task / task controls ---
+  const pauseTask = (task) => {
+    if (task.finished || task.pauseFlag) return;
+    if (task.state === "queued") {
+      const idx = waitingQueue.indexOf(task); // đang chờ → rút khỏi queue, không cần abort
+      if (idx >= 0) waitingQueue.splice(idx, 1);
+      task.pauseFlag = true;
+      task.state = "paused";
+      renderTask(task);
+      return;
+    }
+    if (task.state !== "downloading" && task.state !== "preparing") return;
+    task.pauseFlag = true;
+    task.cancelRequested = false;
+    task.controller.abort(PAUSE_SIGNAL);
+  };
+
+  const resumeTask = (task) => {
+    if (task.finished || !task.pauseFlag) return;
+    task.pauseFlag = false;
+    task.controller = new AbortController();
+    task.state = "queued";
+    task.autoRetries = 0;
+    renderTask(task);
+    waitingQueue.push(task);
+    pumpQueue();
+  };
+
+  const cancelTask = (task) => {
+    if (task.finished) return;
+    task.cancelRequested = true;
+    task.pauseFlag = false;
+    task.controller.abort(new DOMException("Download cancelled", "AbortError"));
+    const idx = waitingQueue.indexOf(task);
+    if (idx >= 0) waitingQueue.splice(idx, 1);
+    if (!task.running) {
+      const cleanup = task.writer
+        ? task.writer.abort().catch(() => {}).then(() => task.writer?.discardCreatedFile?.()).catch(() => {})
+        : Promise.resolve();
+      cleanup.then(() => finishTask(task, "cancelled"));
+    }
+  };
+
+  const retryTask = (task) => {
+    if (!task.finished || !["failed", "cancelled"].includes(task.state)) return;
+    // resume trong phiên: giữ ledger + writer (chỉ tải phần thiếu)
+    task.finished = false;
+    task.error = null;
+    task.state = "queued";
+    task.autoRetries = 0;
+    task.cancelRequested = false;
+    task.pauseFlag = false;
+    task.controller = new AbortController();
+    if (task.ledger && !task.ledger.isComplete()) {
+      task.resumeMode = true; // FsWriter mở lại với keepExistingData
+      log.info(`retry-resume: còn thiếu ${formatBytes(task.ledger.remaining)}`, task.fileName);
+    } else {
+      task.ledger = null; // ledger rỗng/lỗi → tải lại từ đầu
+      task.meter = new SpeedMeter();
+    }
+    downloadTasks.set(task.id, task);
+    activeTasks.set(task.key, task);
+    renderTask(task);
+    waitingQueue.push(task);
+    pumpQueue();
+  };
+
+  // ===========================================================================
+  // SECTION 14: UI — panel + task cards + settings / giao diện
+  // ===========================================================================
+  const TG_LOGO_SVG =
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.5 4.5L2.8 11.7c-.8.3-.8 1.5.1 1.7l4.6 1.4 1.7 5.2c.3.8 1.3 1 1.9.4l2.5-2.4 4.7 3.4c.7.5 1.6.1 1.8-.7L23 5.8c.2-.9-.7-1.6-1.5-1.3z"/></svg>';
+  const DL_ICON_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4"/></svg>';
+  const QUEUE_ICON_SVG =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 15v4h14v-4"/><path d="M12 4v10"/><path d="M8 10l4 4 4-4"/><circle cx="18" cy="6" r="3" fill="currentColor" stroke="none"/></svg>';
+  const GEAR_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>';
+
+  const buildStyles = () => {
+    const style = document.createElement("style");
+    style.textContent = `
+      :root {
+        --sk-bg: #ffffff; --sk-bg-head: #f6f9fc; --sk-fg: #0b1620;
+        --sk-muted: #475668; --sk-line: #d9e2ec;
+        --sk-track: #e3eaf2; --sk-accent: #0b84ff; --sk-accent-fg: #ffffff;
+        --sk-accent-soft: #e4f0ff; --sk-ok: #10b981; --sk-ok-fg: #052012;
+        --sk-warn: #f59e0b; --sk-err: #ef4444; --sk-radius: 14px;
+        --sk-shadow: 0 12px 40px rgba(10,20,40,.22), 0 2px 6px rgba(10,20,40,.08);
+      }
+      html.night, html.theme-dark, html.dark {
+        --sk-bg: #1f2a37; --sk-bg-head: #273341; --sk-fg: #ffffff;
+        --sk-muted: #c5d1dd; --sk-line: #3a4a5c;
+        --sk-track: #334257; --sk-accent: #4aa5ff; --sk-accent-fg: #06111c;
+        --sk-accent-soft: #1b3652; --sk-shadow: 0 12px 40px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.4);
+      }
+      #sk-panel *, #sk-select *, #sk-settings * { box-sizing: border-box; }
+      #sk-panel, #sk-select {
+        position: fixed; z-index: 2147483646;
+        background: var(--sk-bg); color: var(--sk-fg);
+        border: 1px solid var(--sk-line); border-radius: var(--sk-radius);
+        box-shadow: var(--sk-shadow); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        display: flex; flex-direction: column; overflow: hidden;
+      }
+      /* Phải ẩn cả ROOT — #sk-settings{display:flex} từng override rule [hidden]
+         mặc định của UA khiến modal dính vĩnh viễn trên màn hình (bug 2.0.1). */
+      #sk-panel [hidden], #sk-select [hidden], #sk-settings [hidden],
+      #sk-panel[hidden], #sk-select[hidden], #sk-settings[hidden] { display: none !important; }
+
+      #sk-panel {
+        right: max(16px, env(safe-area-inset-right));
+        bottom: max(16px, env(safe-area-inset-bottom));
+        width: min(370px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+      }
+      #sk-panel.collapsed .sk-task-list, #sk-panel.collapsed .sk-foot,
+      #sk-panel.collapsed .sk-empty { display: none; }
+      #sk-select {
+        right: max(16px, env(safe-area-inset-right));
+        top: max(16px, env(safe-area-inset-top));
+        width: min(320px, calc(100vw - 32px)); max-height: 70vh;
+      }
+      #sk-select.collapsed { width: auto; }
+      #sk-select.collapsed .sk-select-body { display: none; }
+
+      .sk-head {
+        display: flex; align-items: center; gap: 8px; padding: 10px 12px; flex-shrink: 0;
+        background: var(--sk-bg-head); border-bottom: 1px solid var(--sk-line);
+        touch-action: none;
+      }
+      .sk-title {
+        flex: 1; min-width: 0; font-weight: 700; font-size: 13.5px;
+        display: flex; align-items: center; gap: 8px; cursor: move; user-select: none;
+      }
+      .sk-logo {
+        width: 24px; height: 24px; flex-shrink: 0; display: inline-flex;
+        align-items: center; justify-content: center; border-radius: 50%;
+        background: linear-gradient(135deg, #37aee2, #1e96c8);
+        box-shadow: 0 2px 6px rgba(55,174,226,.4);
+      }
+      .sk-count {
+        background: var(--sk-accent-soft); color: var(--sk-accent); border-radius: 10px;
+        padding: 3px 10px; font-weight: 700; font-size: 11.5px; font-variant-numeric: tabular-nums;
+      }
+      .sk-count:empty, .sk-count[data-zero="1"] { opacity: .55; }
+      .sk-icon-btn {
+        appearance: none; background: var(--sk-track); color: var(--sk-fg); border: 0;
+        width: 30px; height: 30px; padding: 0; border-radius: 50%;
+        font: 700 16px/1 system-ui; cursor: pointer; display: inline-flex;
+        align-items: center; justify-content: center; transition: background .15s, color .15s;
+      }
+      .sk-icon-btn:hover { background: var(--sk-accent); color: var(--sk-accent-fg); }
+      .sk-icon-btn:active { transform: scale(.94); }
+
+      .sk-task-list { overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+      .sk-empty {
+        padding: 16px 12px; font-size: 12px; color: var(--sk-muted);
+        text-align: center; user-select: none;
+      }
+      .sk-task {
+        border: 1px solid var(--sk-line); border-radius: 10px; padding: 10px;
+        background: var(--sk-bg);
+      }
+      .sk-task-head { display: flex; align-items: center; gap: 8px; }
+      .sk-task-head .name {
+        flex: 1; min-width: 0; font-weight: 600; font-size: 12.5px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .sk-task[data-state="completed"] { border-color: var(--sk-ok); }
+      .sk-task[data-state="failed"], .sk-task[data-state="cancelled"] { border-color: var(--sk-err); }
+      .sk-task[data-state="paused"] { border-color: var(--sk-warn); }
+      .sk-bar {
+        position: relative; height: 8px; border-radius: 4px; margin: 8px 0 6px;
+        background: var(--sk-track); overflow: hidden;
+      }
+      .sk-bar-fill {
+        position: absolute; inset: 0 auto 0 0; width: 0%;
+        background: linear-gradient(90deg, var(--sk-accent), #67b3ff);
+        border-radius: 4px; transition: width .2s ease;
+      }
+      .sk-task[data-state="completed"] .sk-bar-fill { background: var(--sk-ok); }
+      .sk-task[data-state="failed"] .sk-bar-fill, .sk-task[data-state="cancelled"] .sk-bar-fill { background: var(--sk-err); }
+      .sk-task[data-state="paused"] .sk-bar-fill { background: var(--sk-warn); }
+      .sk-bar.indeterminate .sk-bar-fill {
+        width: 30%; animation: sk-indet 1.2s infinite ease-in-out;
+      }
+      @keyframes sk-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+      .sk-stats {
+        font-size: 11.5px; color: var(--sk-muted); font-variant-numeric: tabular-nums;
+        display: flex; gap: 6px; flex-wrap: wrap;
+      }
+      .sk-stats .state-label { font-weight: 700; color: var(--sk-fg); }
+      .sk-err-text { margin: 6px 0 0; font-size: 11.5px; color: var(--sk-err); }
+      .sk-task-actions { display: flex; gap: 6px; margin-top: 8px; }
+      .sk-task-actions .sk-btn { flex: 1; min-height: 28px; padding: 4px 8px; font-size: 11.5px; }
+
+      /* --- hệ nút: base → primary / toggle / danger --- */
+      .sk-btn {
+        appearance: none; border: 1px solid var(--sk-line); background: var(--sk-bg);
+        color: var(--sk-fg); border-radius: 10px; padding: 0 12px; min-height: 34px;
+        font: 700 12px/1.2 inherit; cursor: pointer; user-select: none;
+        display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+        transition: background .15s, border-color .15s, color .15s, box-shadow .15s, transform .05s;
+      }
+      .sk-btn:hover { background: var(--sk-track); border-color: var(--sk-muted); }
+      .sk-btn:active { transform: translateY(1px); }
+      .sk-btn:focus-visible { outline: 2px solid var(--sk-accent); outline-offset: 1px; }
+      .sk-btn:disabled { opacity: .5; cursor: not-allowed; }
+      .sk-btn .sk-btn-ic { display: inline-flex; flex-shrink: 0; }
+      .sk-btn .sk-btn-ic svg { width: 14px; height: 14px; }
+
+      .sk-btn.primary {
+        background: var(--sk-accent); border-color: var(--sk-accent); color: var(--sk-accent-fg);
+        box-shadow: 0 2px 10px rgba(11,132,255,.35);
+      }
+      .sk-btn.primary:hover { filter: brightness(1.08); background: var(--sk-accent); }
+      .sk-btn.primary:disabled {
+        background: var(--sk-track); border-color: var(--sk-track);
+        color: var(--sk-muted); opacity: 1; box-shadow: none; cursor: not-allowed;
+      }
+
+      .sk-btn.toggle::before {
+        content: ""; width: 9px; height: 9px; border-radius: 50%;
+        background: var(--sk-muted); flex-shrink: 0;
+        box-shadow: inset 0 0 0 1.5px rgba(0,0,0,.12);
+      }
+      .sk-btn.toggle:hover { border-color: var(--sk-muted); }
+      .sk-btn.toggle.on {
+        background: var(--sk-ok); border-color: var(--sk-ok); color: var(--sk-ok-fg);
+        box-shadow: 0 2px 10px rgba(16,185,129,.35);
+      }
+      .sk-btn.toggle.on::before { background: var(--sk-ok-fg); box-shadow: none; }
+      .sk-btn.toggle.on:hover { filter: brightness(1.06); background: var(--sk-ok); }
+
+      .sk-btn.danger { color: var(--sk-err); border-color: var(--sk-line); }
+      .sk-btn.danger:hover {
+        background: var(--sk-err); border-color: var(--sk-err); color: #fff;
+      }
+      .sk-btn.danger.on {
+        background: var(--sk-accent); border-color: var(--sk-accent); color: var(--sk-accent-fg);
+        box-shadow: 0 2px 10px rgba(11,132,255,.35);
+      }
+      .sk-btn.danger.on::before { background: var(--sk-accent-fg); }
+
+      .sk-foot {
+        display: flex; justify-content: space-between; padding: 8px 14px;
+        font-size: 11px; color: var(--sk-muted); border-top: 1px solid var(--sk-line);
+      }
+
+      .sk-select-body { padding: 10px 12px; overflow-y: auto; overscroll-behavior: contain; }
+      .sk-hint { font-size: 11.5px; color: var(--sk-muted); margin-bottom: 10px; line-height: 1.6; }
+      .sk-hint b { color: var(--sk-fg); }
+      .sk-hint .keys { opacity: .8; }
+      .sk-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+      .sk-actions .sk-btn { flex: 1; text-align: center; padding: 0 6px; min-height: 36px; font-size: 12px; }
+      #sk-dl-btn { width: 100%; margin-top: 2px; padding: 0 10px; min-height: 42px; font-size: 13px; }
+      /* list mục đã chọn: cao nhất định + scroll riêng — không đẩy panel */
+      .sk-select-list {
+        border-top: 1px dashed var(--sk-line); margin-top: 6px; padding-top: 6px;
+        max-height: 150px; overflow-y: auto; overscroll-behavior: contain;
+      }
+      .sk-select-row {
+        display: flex; align-items: center; gap: 6px; padding: 3px 0;
+        font-size: 11.5px; color: var(--sk-muted);
+      }
+      .sk-select-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sk-select-row button {
+        appearance: none; border: 0; background: none; color: var(--sk-muted);
+        cursor: pointer; font-size: 14px; padding: 0 4px;
+      }
+      .sk-select-row button:hover { color: var(--sk-err); }
+
+      /* tick chọn ảnh */
+      .sk-sel-item {
+        position: relative; outline: 4px solid var(--sk-ok) !important; outline-offset: -4px;
+        box-shadow: 0 0 0 4px rgba(34,197,94,.3), 0 0 20px 2px rgba(34,197,94,.5) !important;
+        border-radius: 6px;
+      }
+      .sk-sel { outline: 2px dashed var(--sk-ok) !important; outline-offset: 2px; border-radius: 8px; }
+      .sk-tick {
+        position: absolute; top: 6px; left: 6px; z-index: 2; width: 28px; height: 28px;
+        border-radius: 50%; background: var(--sk-ok); color: #04150a;
+        font: 900 16px/28px system-ui; text-align: center; pointer-events: none;
+        box-shadow: 0 2px 10px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.4);
+      }
+      .sk-tick::before { content: "✓"; }
+
+      /* settings modal */
+      #sk-settings {
+        position: fixed; inset: 0; z-index: 2147483647;
+        display: flex; align-items: center; justify-content: center;
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      }
+      #sk-settings .backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.45); }
+      #sk-settings .dialog {
+        position: relative; width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+        overflow-y: auto; background: var(--sk-bg, #fff); color: var(--sk-fg, #0b1620);
+        border: 1px solid var(--sk-line, #d9e2ec); border-radius: 16px;
+        box-shadow: var(--sk-shadow, 0 12px 40px rgba(10,20,40,.22)); padding: 18px;
+      }
+      html.night #sk-settings .dialog, html.theme-dark #sk-settings .dialog {
+        --sk-bg: #1f2a37; --sk-fg: #fff; --sk-line: #3a4a5c; --sk-track: #334257;
+        --sk-accent: #4aa5ff; --sk-accent-fg: #06111c; --sk-accent-soft: #1b3652;
+      }
+      #sk-settings h3 { margin: 0 0 14px; font-size: 15px; }
+      #sk-settings .close {
+        position: absolute; top: 12px; right: 12px;
+      }
+      .sk-field { margin-bottom: 12px; }
+      .sk-field > .label { display: block; font-size: 11.5px; font-weight: 700; color: var(--sk-muted, #475668); margin-bottom: 4px; }
+      .sk-field select, .sk-field input[type="text"] {
+        width: 100%; padding: 8px 10px; border-radius: 8px;
+        border: 1px solid var(--sk-line, #d9e2ec); background: var(--sk-bg, #fff);
+        color: var(--sk-fg, #0b1620); font: inherit;
+      }
+      .sk-field .hint { font-size: 11px; color: var(--sk-muted, #475668); margin-top: 3px; }
+      .sk-folder-row { display: flex; gap: 8px; align-items: center; }
+      .sk-folder-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+      .sk-folder-row .name.muted { color: var(--sk-muted, #475668); font-style: italic; }
+      .sk-folder-row .sk-btn, .sk-info-row .sk-btn { min-height: 30px; padding: 0 10px; font-size: 11.5px; }
+      .sk-info-row {
+        display: flex; justify-content: space-between; align-items: center; gap: 8px;
+        font-size: 12px; color: var(--sk-muted, #475668); margin: 10px 0;
+      }
+    `;
+    document.head.appendChild(style);
+  };
+
+  // --- task card render ---
+  const STATE_ORDER_LABEL = (task) => {
+    if (task.state === "downloading" && task.resumeMode) return t("resumedTask", { percent: task.total ? Math.floor(task.received * 100 / task.total) : 0 });
+    return t(task.state);
+  };
+
+  const attachTaskCard = (task) => {
+    const list = document.querySelector("#sk-panel .sk-task-list");
+    if (!list) return null;
+    const card = document.createElement("div");
+    card.id = "sk-task-" + task.id;
+    card.className = "sk-task";
+    card.innerHTML = `
+      <div class="sk-task-head">
+        <span class="name" dir="auto"></span>
+        <button type="button" class="sk-btn danger act-dismiss" title="×" style="min-height:24px;padding:0 8px;">×</button>
+      </div>
+      <div class="sk-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div class="sk-bar-fill"></div>
+      </div>
+      <div class="sk-stats">
+        <span class="state-label"></span>
+        <span class="detail"></span>
+      </div>
+      <p class="sk-err-text" hidden></p>
+      <div class="sk-task-actions">
+        <button type="button" class="sk-btn act-pause"></button>
+        <button type="button" class="sk-btn act-retry" hidden></button>
+        <button type="button" class="sk-btn danger act-cancel"></button>
+      </div>`;
+    card.querySelector(".act-dismiss").onclick = () => dismissTask(task);
+    card.querySelector(".act-pause").onclick = () => {
+      if (task.pauseFlag) resumeTask(task); else pauseTask(task);
+    };
+    card.querySelector(".act-retry").onclick = () => retryTask(task);
+    card.querySelector(".act-cancel").onclick = () => cancelTask(task);
+    list.prepend(card);
+    return card;
+  };
+
+  const dismissTask = (task) => {
+    document.getElementById("sk-task-" + task.id)?.remove();
+    if (task.finished) downloadTasks.delete(task.id);
+    updatePanelCounts();
+  };
+
+  const renderTaskImpl = (task, scroll = false) => {
+    const panel = document.getElementById("sk-panel");
+    if (!panel) return;
+    let card = document.getElementById("sk-task-" + task.id);
+    if (!card) {
+      card = attachTaskCard(task);
+      if (!card) return;
+      panel.classList.remove("collapsed");
+      const toggle = panel.querySelector(".sk-toggle");
+      toggle.textContent = "–"; toggle.title = t("hide");
+    }
+    if (scroll) card.scrollIntoView({ block: "nearest" });
+    card.dataset.state = task.state;
+    card.querySelector(".name").textContent = task.fileName;
+    card.querySelector(".name").title = task.fileName;
+
+    const pct = task.total ? Math.min(100, Math.floor(task.received * 100 / task.total)) : null;
+    const bar = card.querySelector(".sk-bar");
+    bar.setAttribute("aria-label", t("progress"));
+    bar.classList.toggle("indeterminate", task.state === "downloading" && pct === null);
+    if (pct === null) bar.removeAttribute("aria-valuenow");
+    else bar.setAttribute("aria-valuenow", pct);
+    bar.querySelector(".sk-bar-fill").style.width = (pct ?? 0) + "%";
+
+    card.querySelector(".state-label").textContent =
+      task.state === "downloading" && pct !== null ? `${intFmt().format(pct)}% · ${t("downloading")}` : STATE_ORDER_LABEL(task);
+
+    const parts = [formatBytes(task.received) + (task.total != null ? ` / ${formatBytes(task.total)}` : "")];
+    if (task.state === "downloading" && task.speed) {
+      parts.push(t("rate", { speed: formatBytes(task.speed) }));
+      if (task.eta != null && task.eta > 1) parts.push(t("eta", { time: formatDuration(task.eta) }));
+    }
+    card.querySelector(".detail").textContent = parts.join(" · ");
+
+    const errEl = card.querySelector(".sk-err-text");
+    errEl.textContent = formatError(task.error);
+    errEl.hidden = !task.error;
+
+    const canPause = ["downloading", "preparing", "queued"].includes(task.state) && !task.finished;
+    const pauseBtn = card.querySelector(".act-pause");
+    pauseBtn.textContent = task.pauseFlag ? t("resume") : t("pause");
+    pauseBtn.hidden = !(canPause || task.state === "paused");
+    const cancelBtn = card.querySelector(".act-cancel");
+    cancelBtn.textContent = t("cancel");
+    cancelBtn.hidden = task.finished || task.state === "saving";
+    cancelBtn.disabled = task.state === "saving";
+    const retryBtn = card.querySelector(".act-retry");
+    retryBtn.textContent = t("retry");
+    retryBtn.hidden = !["failed", "cancelled"].includes(task.state);
+    updatePanelCounts();
+  };
+
+  const updatePanelCountsImpl = () => {
+    const panel = document.getElementById("sk-panel");
+    if (!panel) return;
+    const hasTasks = !!panel.querySelector(".sk-task");
+    const empty = panel.querySelector(".sk-empty");
+    if (empty) {
+      empty.hidden = hasTasks;
+      empty.textContent = t("noTasks");
+    }
+    const n = [...downloadTasks.values()].filter((x) => !x.finished).length;
+    panel.querySelector(".sk-title-text").textContent = n ? t("downloadsCount", { count: intFmt().format(n) }) : t("downloads");
+  };
+
+  // ===========================================================================
+  // SECTION 15: dựng panel + settings modal / panels & modal
+  // ===========================================================================
+  let panel, selectBar, settingsModal;
+  let selModeBtn, selAutoBtn, selAllBtn, selClearBtn, selDlBtn, selCount, selList, selHint, selTitle;
+  let settingsEls = {};
+
+  const buildUI = () => {
+    buildStyles();
+
+    // Downloads panel — luôn hiển thị (kể cả khi rỗng) để luôn thấy được trên viewer
+    panel = document.createElement("section");
+    panel.id = "sk-panel";
+    panel.innerHTML = `
+      <div class="sk-head">
+        <div class="sk-title">
+          <span class="sk-logo">${TG_LOGO_SVG}</span>
+          <span class="sk-title-text">${t("downloads")}</span>
+        </div>
+        <button type="button" class="sk-icon-btn sk-clear" title=""></button>
+        <button type="button" class="sk-icon-btn sk-settings-btn" title="">${GEAR_SVG}</button>
+        <button type="button" class="sk-icon-btn sk-toggle" title="">–</button>
+      </div>
+      <div class="sk-task-list">
+        <div class="sk-empty" hidden></div>
+      </div>
+      <div class="sk-foot">
+        <span>SakerLy</span>
+        <span>v${SCRIPT_VERSION}</span>
+      </div>`;
+    document.body.appendChild(panel);
+
+    const panelToggle = panel.querySelector(".sk-toggle");
+    panelToggle.onclick = () => {
+      const col = !panel.classList.contains("collapsed");
+      panel.classList.toggle("collapsed", col);
+      panelToggle.textContent = col ? "+" : "–";
+      panelToggle.title = col ? t("show") : t("hide");
+    };
+    // Xoá toàn bộ danh sách: task xong + queued/paused/failed (hủy rồi bỏ card,
+    // kể cả card mồ côi do evict); chỉ giữ task đang thực sự chạy.
+    panel.querySelector(".sk-clear").onclick = () => {
+      for (const card of [...panel.querySelectorAll(".sk-task")]) {
+        const id = (card.id || "").replace("sk-task-", "");
+        const task = downloadTasks.get(id);
+        const active = task && !task.finished &&
+          ["downloading", "preparing", "saving"].includes(task.state);
+        if (active) continue;
+        if (task && !task.finished) cancelTask(task);
+        card.remove();
+        downloadTasks.delete(id);
+      }
+      updatePanelCounts();
+    };
+    panel.querySelector(".sk-clear").title = t("clearHistory");
+    panel.querySelector(".sk-settings-btn").onclick = () => { settingsModal.hidden = false; refreshSettingsUI(); };
+    makeDraggable(panel, panel.querySelector(".sk-head"), "panelPos");
+
+    // --- select bar ---
+    selectBar = document.createElement("section");
+    selectBar.id = "sk-select";
+    selectBar.innerHTML = `
+      <div class="sk-head">
+        <div class="sk-title">
+          <span class="sk-logo">${TG_LOGO_SVG}</span>
+          <span class="sk-select-title"></span>
+        </div>
+        <span class="sk-count sk-sel-count">0</span>
+        <button type="button" class="sk-icon-btn sk-select-settings" title="">${GEAR_SVG}</button>
+        <button type="button" class="sk-icon-btn sk-select-toggle" title="">–</button>
+      </div>
+      <div class="sk-select-body">
+        <div class="sk-hint sk-hint-box"></div>
+        <div class="sk-select-list" hidden></div>
+        <div class="sk-actions">
+          <button type="button" id="sk-mode-btn" class="sk-btn toggle"></button>
+          <button type="button" id="sk-auto-btn" class="sk-btn toggle"></button>
+        </div>
+        <div class="sk-actions">
+          <button type="button" id="sk-all-btn" class="sk-btn"></button>
+          <button type="button" id="sk-clear-btn" class="sk-btn"></button>
+        </div>
+        <button type="button" id="sk-dl-btn" class="sk-btn primary"></button>
+      </div>`;
+    document.body.appendChild(selectBar);
+
+    const selToggle = selectBar.querySelector(".sk-select-toggle");
+    selToggle.onclick = () => {
+      const col = !selectBar.classList.contains("collapsed");
+      selectBar.classList.toggle("collapsed", col);
+      selToggle.textContent = col ? "+" : "–";
+      selToggle.title = col ? t("show") : t("hide");
+    };
+    selectBar.querySelector(".sk-select-settings").onclick = () => {
+      settingsModal.hidden = false; refreshSettingsUI();
+    };
+    makeDraggable(selectBar, selectBar.querySelector(".sk-head"), "selectBarPos");
+
+    selModeBtn = selectBar.querySelector("#sk-mode-btn");
+    selAutoBtn = selectBar.querySelector("#sk-auto-btn");
+    selAllBtn = selectBar.querySelector("#sk-all-btn");
+    selClearBtn = selectBar.querySelector("#sk-clear-btn");
+    selDlBtn = selectBar.querySelector("#sk-dl-btn");
+    selCount = selectBar.querySelector(".sk-sel-count");
+    selList = selectBar.querySelector(".sk-select-list");
+    selHint = selectBar.querySelector(".sk-hint-box");
+    selTitle = selectBar.querySelector(".sk-select-title");
+
+    // --- settings modal ---
+    settingsModal = document.createElement("div");
+    settingsModal.id = "sk-settings";
+    settingsModal.hidden = true;
+    settingsModal.innerHTML = `
+      <div class="backdrop"></div>
+      <div class="dialog">
+        <button type="button" class="sk-icon-btn close"></button>
+        <h3></h3>
+        <div class="sk-field">
+          <span class="label" data-key="lang"></span>
+          <select class="sk-lang-select">
+            <option value="vi">Tiếng Việt</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+        <div class="sk-field">
+          <span class="label" data-key="connections"></span>
+          <select class="sk-settings-connections">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
+          <div class="hint" data-key="connectionsHint"></div>
+        </div>
+        <div class="sk-field">
+          <span class="label" data-key="naming"></span>
+          <select class="sk-settings-naming">
+            <option value="original" data-key="namingOriginal"></option>
+            <option value="date" data-key="namingDate"></option>
+            <option value="seq" data-key="namingSeq"></option>
+            <option value="date_original" data-key="namingDateOriginal"></option>
+            <option value="seq_original" data-key="namingSeqOriginal"></option>
+          </select>
+        </div>
+        <div class="sk-field">
+          <span class="label" data-key="prefix"></span>
+          <input type="text" class="sk-settings-prefix" maxlength="60">
+        </div>
+        <div class="sk-field">
+          <span class="label" data-key="folder"></span>
+          <div class="sk-folder-row">
+            <span class="name sk-folder-name"></span>
+            <button type="button" class="sk-btn sk-pickdir"></button>
+            <button type="button" class="sk-btn sk-cleardir" hidden></button>
+          </div>
+        </div>
+        <div class="sk-field">
+          <span class="label" data-key="subfolder"></span>
+          <select class="sk-settings-subfolder">
+            <option value="none" data-key="subfolderNone"></option>
+            <option value="date" data-key="subfolderDate"></option>
+            <option value="channel" data-key="subfolderChannel"></option>
+            <option value="date_channel" data-key="subfolderDateChannel"></option>
+            <option value="channel_date" data-key="subfolderChannelDate"></option>
+          </select>
+        </div>
+        <div class="sk-info-row">
+          <span class="sk-seq-info"></span>
+          <button type="button" class="sk-btn sk-resetseq"></button>
+        </div>
+        <div class="sk-info-row">
+          <span class="sk-downloaded-info"></span>
+          <button type="button" class="sk-btn sk-forget"></button>
+        </div>
+      </div>`;
+    document.body.appendChild(settingsModal);
+
+    settingsEls = {
+      close: settingsModal.querySelector(".close"),
+      title: settingsModal.querySelector("h3"),
+      lang: settingsModal.querySelector(".sk-lang-select"),
+      conn: settingsModal.querySelector(".sk-settings-connections"),
+      naming: settingsModal.querySelector(".sk-settings-naming"),
+      prefix: settingsModal.querySelector(".sk-settings-prefix"),
+      pickDir: settingsModal.querySelector(".sk-pickdir"),
+      clearDir: settingsModal.querySelector(".sk-cleardir"),
+      folderName: settingsModal.querySelector(".sk-folder-name"),
+      subfolder: settingsModal.querySelector(".sk-settings-subfolder"),
+      resetSeq: settingsModal.querySelector(".sk-resetseq"),
+      seqInfo: settingsModal.querySelector(".sk-seq-info"),
+      downloadedInfo: settingsModal.querySelector(".sk-downloaded-info"),
+      forget: settingsModal.querySelector(".sk-forget"),
+    };
+
+    settingsEls.close.textContent = "×";
+    settingsEls.close.onclick = () => { settingsModal.hidden = true; };
+    settingsModal.querySelector(".backdrop").onclick = () => { settingsModal.hidden = true; };
+    // Esc đóng modal trước khi viewer của TG xử lý
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !settingsModal.hidden) {
+        e.preventDefault(); e.stopPropagation();
+        settingsModal.hidden = true;
+      }
+    }, true);
+
+    settingsEls.lang.onchange = () => {
+      currentLang = settingsEls.lang.value;
+      saveStore("lang", currentLang);
+      refreshAllLabels();
+      refreshSettingsUI();
+    };
+    settingsEls.conn.onchange = () => {
+      settings.connections = Number(settingsEls.conn.value) || 3;
+      saveStore("settings", settings);
+      log.info(`connections = ${getConnections()}`);
+    };
+    settingsEls.naming.onchange = () => { settings.naming = settingsEls.naming.value; saveStore("settings", settings); };
+    settingsEls.subfolder.onchange = () => { settings.subfolder = settingsEls.subfolder.value; saveStore("settings", settings); };
+    settingsEls.prefix.oninput = () => { settings.prefix = settingsEls.prefix.value; saveStore("settings", settings); };
+    settingsEls.resetSeq.onclick = () => { seqCounter = 1; saveStore("seq", 1); refreshSettingsUI(); };
+    settingsEls.forget.onclick = () => {
+      downloadedKeys = new Set();
+      saveStore("downloaded", []);
+      seenAutoQueueKeys.clear();
+      queuedViewerKeys.clear();
+      refreshSettingsUI();
+    };
+    settingsEls.pickDir.onclick = async () => {
+      if (!supportsDirPicker()) return;
+      try {
+        const h = await window.showDirectoryPicker({ mode: "readwrite" });
+        destDirHandle = h; destDirName = h.name;
+        await idbSet("destDirHandle", h);
+        saveStore("destDirName", destDirName);
+        refreshSettingsUI();
+      } catch (e) { if (e?.name !== "AbortError") log.error("pickFolder: " + e.message); }
+    };
+    settingsEls.clearDir.onclick = async () => {
+      destDirHandle = null; destDirName = "";
+      await idbDel("destDirHandle");
+      saveStore("destDirName", "");
+      refreshSettingsUI();
+    };
+
+    // Dịch text tĩnh ngay lúc dựng UI — modal không bao giờ trắng (bug 2.0.1)
+    translateSettingsUI();
+
+    renderTask = renderTaskImpl;
+    updatePanelCounts = updatePanelCountsImpl;
+    updateSelectBar();
+  };
+
+  const supportsDirPicker = () =>
+    typeof window.showDirectoryPicker === "function";
+
+  // Dịch text tĩnh (nhãn, option, nút) — chạy lúc dựng UI + mỗi lần mở/đổi ngôn ngữ
+  const translateSettingsUI = () => {
+    if (!settingsModal || !settingsEls.title) return;
+    settingsEls.title.textContent = t("settingsTitle");
+    settingsEls.close.title = t("close");
+    settingsModal.querySelectorAll("[data-key]").forEach((el) => { el.textContent = t(el.dataset.key); });
+    settingsEls.prefix.placeholder = t("prefixPlaceholder");
+    settingsEls.pickDir.textContent = t("pickFolder");
+    settingsEls.clearDir.textContent = t("clearFolder");
+    settingsEls.resetSeq.textContent = t("resetSeq");
+    settingsEls.forget.textContent = t("forgetDownloaded");
+  };
+
+  const refreshSettingsUI = () => {
+    if (!settingsModal || settingsModal.hidden) return;
+    translateSettingsUI();
+    settingsEls.lang.value = currentLang;
+    settingsEls.conn.value = String(getConnections());
+    settingsEls.naming.value = settings.naming;
+    settingsEls.subfolder.value = settings.subfolder || "none";
+    settingsEls.subfolder.disabled = !destDirName;
+    settingsEls.prefix.value = settings.prefix || "";
+    settingsEls.folderName.textContent = destDirName || t("folderNone");
+    settingsEls.folderName.classList.toggle("muted", !destDirName);
+    settingsEls.pickDir.disabled = !supportsDirPicker();
+    settingsEls.pickDir.title = supportsDirPicker() ? "" : t("folderUnsupported");
+    settingsEls.clearDir.hidden = !destDirName;
+    settingsEls.seqInfo.textContent = t("seqNow", { n: seqCounter });
+    settingsEls.downloadedInfo.textContent = t("downloadedCount", { n: downloadedKeys.size });
+    settingsEls.forget.disabled = downloadedKeys.size === 0;
+  };
+
+  const makeDraggable = (el, handle, storageKey) => {
+    const apply = () => {
+      try {
+        const pos = loadStore(storageKey, null);
+        if (!pos || typeof pos.left !== "number" || typeof pos.top !== "number") return;
+        const maxL = window.innerWidth - el.offsetWidth - 4;
+        const maxT = window.innerHeight - el.offsetHeight - 4;
+        el.style.left = Math.max(4, Math.min(pos.left, maxL)) + "px";
+        el.style.top = Math.max(4, Math.min(pos.top, maxT)) + "px";
+        el.style.right = "auto"; el.style.bottom = "auto";
+      } catch {}
+    };
+    requestAnimationFrame(apply);
+    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+    handle.style.cursor = "move";
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.target.closest("button, select, input, a")) return;
+      dragging = true;
+      handle.setPointerCapture(e.pointerId);
+      const r = el.getBoundingClientRect();
+      sl = r.left; st = r.top; sx = e.clientX; sy = e.clientY;
+      el.style.left = sl + "px"; el.style.top = st + "px";
+      el.style.right = "auto"; el.style.bottom = "auto";
+    });
+    handle.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const l = sl + (e.clientX - sx), tp = st + (e.clientY - sy);
+      const maxL = window.innerWidth - el.offsetWidth - 4;
+      const maxT = window.innerHeight - el.offsetHeight - 4;
+      el.style.left = Math.max(4, Math.min(l, maxL)) + "px";
+      el.style.top = Math.max(4, Math.min(tp, maxT)) + "px";
+    });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try { handle.releasePointerCapture(e.pointerId); } catch {}
+      saveStore(storageKey, { left: parseFloat(el.style.left), top: parseFloat(el.style.top) });
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  };
+
+  const refreshAllLabels = () => {
+    if (!panel) return;
+    panel.querySelector(".sk-clear").title = t("clearHistory");
+    panel.querySelector(".sk-settings-btn").title = t("settings");
+    const pToggle = panel.querySelector(".sk-toggle");
+    pToggle.title = panel.classList.contains("collapsed") ? t("show") : t("hide");
+    const sToggle = selectBar.querySelector(".sk-select-toggle");
+    sToggle.title = selectBar.classList.contains("collapsed") ? t("show") : t("hide");
+    for (const task of downloadTasks.values()) renderTask(task);
+    updateSelectBar();
+    document.querySelectorAll("button.sk-dl-btn").forEach((b) => {
+      const label = t(b.disabled ? "loadingMedia" : "download");
+      b.title = label; b.setAttribute("aria-label", label);
+    });
+    document.querySelectorAll("button.sk-queue-btn").forEach((b) => {
+      b.title = t("topbarQueue"); b.setAttribute("aria-label", t("topbarQueue"));
+    });
+    refreshSettingsUI();
+  };
+
+  // ===========================================================================
+  // SECTION 16: truy cập nguồn media / media source accessors
+  // ===========================================================================
+  // WebA mở media viewer bằng <dialog>.showModal() → dialog nằm trong TOP LAYER
+  // của browser: vẽ TRÊN MỌI z-index và khiến phần còn lại của trang inert (không
+  // click được). Cách duy nhất để panel vẫn hiện + click được trên viewer là
+  // chuyển panel vào bên trong dialog đang mở, đóng thì trả về body.
+  const keepPanelsOnTop = () => {
+    if (TEST_MODE) return;
+    let host = document.body;
+    const dlg = document.getElementById("MediaViewer");
+    if (dlg && dlg.open) host = dlg;
+    for (const el of [panel, selectBar, settingsModal]) {
+      if (el && el.parentElement !== host) host.appendChild(el);
+    }
+  };
+
   const getMediaSource = (m) =>
     m?.getAttribute?.("src") ? m.src : m?.currentSrc || m?.querySelector?.("source")?.src;
 
-  const getPinnedMedia = () => {
-    const pinned = document.querySelector(".pinned-audio");
-    const mid = pinned?.getAttribute("data-mid");
-    if (!mid) return null;
-    const peer = pinned.getAttribute("data-peer-id");
-    const cands = Array.from(document.querySelectorAll("audio-element")).filter(
-      (el) => el.closest(".bubble") && el.getAttribute("data-mid") === mid &&
-        (!peer || el.closest("[data-peer-id]")?.getAttribute("data-peer-id") === peer)
-    );
-    const el = cands.length === 1 ? cands[0] : cands.find((c) => c.audio && !c.audio.paused);
-    const url = getMediaSource(el?.audio);
-    return url ? { url, kind: el.audio.tagName === "AUDIO" ? "audio" : "video" } : null;
+  const isUsableBtn = (b) => {
+    if (b.disabled || b.getAttribute("aria-disabled") === "true" ||
+        b.hidden || b.classList.contains("hide") || b.closest("[inert]")) return false;
+    const s = getComputedStyle(b);
+    return s.visibility !== "hidden" && s.visibility !== "collapse" && b.getClientRects().length > 0;
   };
 
-  // when the viewer DOM contains ANY video context (video element, player chrome, or video progress bar)
-  // we must not fall back to the poster <img.thumbnail>: that's the preview, not the real video src.
-  // return null until the <video>'s src attaches on real playback — the observer will re-poll.
+  // --- WebK: nút download gốc / native download button discovery ------------
+  const WEBK_DL_SELECTOR = [
+    "button.quality-download-options-button-menu",
+    "button.tgico-download",
+    'button[aria-label="Download"]',
+    'button[title="Download"]',
+  ].join(",");
+  const getWebKDlButtons = (c) =>
+    Array.from(c.querySelectorAll(WEBK_DL_SELECTOR)).filter((b) => !b.matches(".sk-dl-btn"));
+
+  let webKGlyph = "";
+  const createWebKDlIcon = (btnIcon = false) => {
+    const glyph = webKGlyph || DL_ICON_SVG;
+    return `<span class="tgico sk-dl-icon${btnIcon ? " button-icon" : ""}" aria-hidden="true">${glyph}</span>`;
+  };
+  const refreshWebKGlyph = () => {
+    for (const b of getWebKDlButtons(document)) {
+      const g = b.querySelector(":scope > .tgico")?.textContent.trim();
+      if (!g || !/^[\uE000-\uF8FF]$/.test(g)) continue;
+      if (g !== webKGlyph) {
+        webKGlyph = g;
+        document.querySelectorAll(".sk-dl-icon").forEach((i) => (i.textContent = g));
+      }
+      return;
+    }
+  };
+
   const VIDEO_CONTEXT_SELECTOR = "video, .ckin__player, .media-viewer-video-progress, [class*='video-time']";
   const resolveViewerWebKMedia = () => {
     const viewer = document.querySelector(".media-viewer-whole");
@@ -771,6 +2212,23 @@
     if (videoUrl) return { url: videoUrl, kind: "video" };
     if (videoEl || media.querySelector(VIDEO_CONTEXT_SELECTOR)) return null;
     const imgUrl = getMediaSource(media.querySelector("img.thumbnail"));
+    if (imgUrl) return { url: imgUrl, kind: "image" };
+    return null;
+  };
+
+  // --- WebA viewer: đọc media đang xem ---
+  // Chỉ slide active mới có <video> (slide khác chỉ là poster ảnh) — resolve đúng
+  // active; nếu là slide video mà src chưa gắn thì trả null (chờ), không nhầm
+  // poster thành ảnh.
+  const resolveViewerWebAMedia = () => {
+    const media = document.querySelector("#MediaViewer .MediaViewerSlide--active");
+    if (!media) return null;
+    const player = media.querySelector(".VideoPlayer");
+    const videoUrl = getMediaSource(player?.querySelector("video"));
+    if (videoUrl) return { url: videoUrl, kind: "video" };
+    if (player) return null; // slide video nhưng src chưa có
+    const imgUrl = getMediaSource(media.querySelector(".MediaViewerContent > div > img"))
+      || getMediaSource(media.querySelector(".MediaViewerContent img"));
     if (imgUrl) return { url: imgUrl, kind: "image" };
     return null;
   };
@@ -789,17 +2247,71 @@
     if (r) downloadMedia(r.url, r.kind);
   };
 
-  const queuedViewerUrls = new Set();
+  // --- hàng đợi viewer / viewer queue ---
+  const queuedViewerKeys = new Set();
+  const queueCurrentWebKMedia = () => {
+    const r = resolveViewerWebKMedia();
+    if (!r) return;
+    const mk = mediaKey(r.url);
+    if (queuedViewerKeys.has(mk)) return;
+    queuedViewerKeys.add(mk);
+    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
+    log.info(`queued: ${r.kind}`);
+  };
 
-  // next-slide button in WebK viewer — grouped album carousel + regular media switcher.
-  // click goes through TG's own listener (trusted click on real element), so synthetic key dispatch is not needed.
-  const WEBK_NEXT_SELECTORS = [
-    ".media-viewer-switcher.media-viewer-switcher-next",
-    ".media-viewer-switcher-next",
-  ].join(",");
+  const queueCurrentWebAMedia = () => {
+    const r = resolveViewerWebAMedia();
+    if (!r) return;
+    const mk = mediaKey(r.url);
+    if (queuedViewerKeys.has(mk)) return;
+    queuedViewerKeys.add(mk);
+    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
+    log.info(`queued: ${r.kind}`);
+  };
+
+  // Nút hàng đợi kiểu WebA (Button smaller translucent-white round) — dùng class
+  // gốc của WebA để hoà hợp giao diện viewer.
+  const makeWebAQueueButton = () => {
+    const b = document.createElement("button");
+    b.className = "Button smaller translucent-white round sk-queue-btn";
+    b.type = "button";
+    b.title = t("topbarQueue");
+    b.setAttribute("aria-label", t("topbarQueue"));
+    b.innerHTML = `<span class="sk-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
+    b.onclick = (e) => {
+      e.stopPropagation();
+      queueCurrentWebAMedia();
+      b.classList.add("queued");
+      setTimeout(() => b.classList.remove("queued"), 1200);
+    };
+    return b;
+  };
+
+  const WEBK_NEXT_SELECTORS = ".media-viewer-switcher.media-viewer-switcher-next, .media-viewer-switcher-next";
   let autoAdvanceRunning = false;
+  // Tự chuyển slide kế tiếp — WebK: click switcher; WebA: click nút .navigation.next
+  // hoặc fallback synthetic ArrowRight (WebA gắn keydown trên document).
   const autoAdvanceViewer = () => {
     if (autoAdvanceRunning) return;
+    if (isWebA) {
+      const dlg = document.getElementById("MediaViewer");
+      if (!dlg || !dlg.open) return;
+      const next = dlg.querySelector("button.navigation.next");
+      if (next && isUsableBtn(next)) {
+        autoAdvanceRunning = true;
+        try { next.click(); } catch {}
+        setTimeout(() => { autoAdvanceRunning = false; }, 350);
+        return;
+      }
+      autoAdvanceRunning = true;
+      try {
+        document.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "ArrowRight", code: "ArrowRight", bubbles: true, cancelable: true,
+        }));
+      } catch {}
+      setTimeout(() => { autoAdvanceRunning = false; }, 350);
+      return;
+    }
     const viewer = document.querySelector(".media-viewer-whole");
     if (!viewer) return;
     const next = viewer.querySelector(WEBK_NEXT_SELECTORS);
@@ -809,39 +2321,71 @@
     setTimeout(() => { autoAdvanceRunning = false; }, 350);
   };
 
-  const queueCurrentWebKMedia = () => {
-    const r = resolveViewerWebKMedia();
-    if (!r) return;
-    // manual click: dedupe within this session only — an explicit click may re-download on purpose
-    const mk = mediaKey(r.url);
-    if (queuedViewerUrls.has(mk)) return;
-    queuedViewerUrls.add(mk);
-    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
-    log.info(`queued: ${r.kind}`);
-  };
-
-  // ===== WebA (web.telegram.org/a/) =========================================
-  const getWebADlButtons = (c) =>
-    Array.from(c.querySelectorAll("button")).filter(
-      (b) => !b.classList.contains("sakerly-dl") &&
-        (b.querySelector(".icon-download") || b.title === "Download" ||
-          b.getAttribute("aria-label") === "Download") && isUsableBtn(b)
+  // --- WebK pinned audio ------------------------------------------------------
+  const getPinnedMedia = () => {
+    const pinned = document.querySelector(".pinned-audio");
+    const mid = pinned?.getAttribute("data-mid");
+    if (!mid) return null;
+    const peer = pinned.getAttribute("data-peer-id");
+    const cands = Array.from(document.querySelectorAll("audio-element")).filter(
+      (el) => el.closest(".bubble") && el.getAttribute("data-mid") === mid &&
+        (!peer || el.closest("[data-peer-id]")?.getAttribute("data-peer-id") === peer)
     );
-  const downloadCurrentWebAMedia = () => {
-    const media = document.querySelector("#MediaViewer .MediaViewerSlide--active");
-    const vUrl = getMediaSource(media?.querySelector(".VideoPlayer video"));
-    const iUrl = getMediaSource(media?.querySelector(".MediaViewerContent > div > img"));
-    if (vUrl) downloadMedia(vUrl, "video");
-    else if (iUrl) downloadMedia(iUrl, "image");
+    const el = cands.length === 1 ? cands[0] : cands.find((c) => c.audio && !c.audio.paused);
+    const url = getMediaSource(el?.audio);
+    return url ? { url, kind: el.audio.tagName === "AUDIO" ? "audio" : "video" } : null;
   };
 
-  // ===== bubble resolution for batch select =================================
-  // album items in tweb carry their own data-mid (prepareAlbum.ts), so [data-mid] must not count as a bubble
-  const BUBBLE_SELECTORS = [".bubble", ".Message"].join(",");
-  const VIDEO_HINT_SELECTOR = [
-    "[class*='play']", "[class*='Play']",
-    "[class*='duration']", "[class*='Duration']",
-  ].join(",");
+  // ===========================================================================
+  // SECTION 17: batch select — chọn ảnh hàng loạt
+  // ===========================================================================
+  const BUBBLE_SELECTORS = ".bubble, .Message";
+  const VIDEO_HINT_SELECTOR = "[class*='play'], [class*='Play'], [class*='duration'], [class*='Duration']";
+
+  const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message .media-inner";
+  const EXCLUDED_SCOPES = [
+    ".EmbeddedMessage", ".WebPage", ".reply", ".reply-content", ".reply-summary", ".reply-wrapper",
+    ".reply-media", ".webpage", ".webpage-preview", ".webpage-with-thumb", ".webpage-thumb",
+    ".bubbles-group-avatar", ".bubbles-group-avatar-container", ".user-avatar",
+    ".bubble-name-forwarded-avatar", "avatar-element", ".avatar", ".service-msg",
+    ".bubble-service-media", ".sticker-wrapper", "[class*='Sticker']", ".custom-emoji",
+    "[class*='CustomEmoji']", ".emoji", ".reactions", ".reactions-like-block", ".reaction",
+    "[class*='Reaction']", ".peer-title", ".bubble-name-chip-container", "[class*='Avatar']",
+  ].join(", ");
+  const EXCLUDED_BUBBLE_CLASSES = ".bubble.service, .bubble.has-fake-service, .bubble.sticker, .bubble.round, .bubble.emoji-big, .bubble.is-invoice";
+
+  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .bubble .bubble__media-container, .Message .album-item, .Message .media-inner";
+  const PHOTO_IMG_SELECTOR = "img.media-photo, img.full-media";
+  const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player, .media-inner.dark, .message-media-duration, .RoundVideo";
+
+  const scopeIsVideoLike = (scope) => scope.matches(VIDEO_MARKERS) || !!scope.querySelector(VIDEO_MARKERS);
+  const looksLikeUnopenedVideo = (scope) =>
+    !scope.querySelector("video") && (scopeIsVideoLike(scope) || !!scope.querySelector(VIDEO_HINT_SELECTOR));
+
+  const pickPhotoScopes = (root) =>
+    Array.from(root.querySelectorAll(PHOTO_SCOPE_SELECTOR)).filter((s) => {
+      if (s.closest(EXCLUDED_SCOPES)) return false;
+      const bubble = s.closest(".bubble, .Message");
+      if (!bubble || bubble.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
+      if (scopeIsVideoLike(s)) return false;
+      if (s.matches(".attachment") && s.querySelector(".album-item")) return false;
+      if (s.matches(".media-inner") && s.closest(".album-item")) return false;
+      return !!s.querySelector(PHOTO_IMG_SELECTOR);
+    });
+
+  const scopeToPhotoItem = (scope) => {
+    const img = Array.from(scope.querySelectorAll(PHOTO_IMG_SELECTOR))
+      .filter((i) => i.naturalWidth > 100 && !i.closest(EXCLUDED_SCOPES))
+      .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0];
+    if (!img) return null;
+    const url = getMediaSource(img);
+    if (!url) return null;
+    // Key msg: dùng chung cho cả album → thêm hash URL để mỗi ảnh trong album là
+    // một mục riêng (không bị gộp còn 1, không bị trùng lặp khi chọn lại)
+    const base = mediaKey(url, img);
+    const key = base.startsWith("msg:") ? `${base}.${hashCode(url).toString(36)}` : base;
+    return { url, kind: "image", el: img, key };
+  };
 
   const findBubble = (node) => {
     let n = node;
@@ -851,138 +2395,20 @@
     }
     return null;
   };
-  // tweb (web.telegram.org/k/): photo/video posts wrap in `.bubble .attachment`; album pieces are `.album-item` under it.
-  // Everything OUTSIDE .attachment — reply quotes (.reply/.reply-content), link previews (.webpage/.webpage-preview),
-  // avatars (.bubbles-group-avatar/.user-avatar/.bubble-name-forwarded-avatar), stickers (.bubble.sticker),
-  // video-round (.bubble.round), emoji-big, service bubbles — never selects.
-  // `.bubble__media-container` replaces `.attachment` on bubbles with a media tail (bubbles.ts viewer targets)
-  // webA (telegram-tt): message root `.Message`, every photo/video renders as `.media-inner`
-  // (Photo.tsx / Video.tsx), album pieces as `.album-item` (Album.tsx); reply previews are
-  // `.EmbeddedMessage`, link previews `.WebPage` (class names are case-sensitive).
-  const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message .media-inner";
-  const EXCLUDED_SCOPES = ".EmbeddedMessage, .WebPage, .reply,.reply-content, .reply-summary, .reply-wrapper, .reply-media, .webpage, .webpage-preview, .webpage-with-thumb, .webpage-thumb, .bubbles-group-avatar, .bubbles-group-avatar-container, .user-avatar, .bubble-name-forwarded-avatar, avatar-element, .avatar, .service-msg, .bubble-service-media, .sticker-wrapper, [class*='Sticker'], .custom-emoji, [class*='CustomEmoji'], .emoji, .reactions, .reactions-like-block, .reaction, [class*='Reaction'], .peer-title, .bubble-name-chip-container, [class*='Avatar']";
-  const EXCLUDED_BUBBLE_CLASSES = ".bubble.service, .bubble.has-fake-service, .bubble.sticker, .bubble.round, .bubble.emoji-big, .bubble.is-invoice";
-  const isRealAttachment = (el) => {
-    if (!el) return false;
-    if (el.closest(EXCLUDED_SCOPES)) return false;
-    return !!el.closest(ATTACHMENT_CONTAINER);
-  };
   const bubbleHasMedia = (b) => {
-    if (b.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
+    if (!b || b.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
     const atts = b.querySelectorAll(ATTACHMENT_CONTAINER);
     for (const a of atts) if (!a.closest(EXCLUDED_SCOPES)) return true;
     return false;
   };
-  const allBubbles = () =>
-    Array.from(document.querySelectorAll(BUBBLE_SELECTORS)).filter(bubbleHasMedia);
 
-  const looksLikeUnopenedVideo = (scope) =>
-    !scope.querySelector("video") && (scopeIsVideoLike(scope) || !!scope.querySelector(VIDEO_HINT_SELECTOR));
-
-  const resolveMediaElement = (el) => {
-    if (!isRealAttachment(el)) return null;
-    if (el.tagName === "VIDEO") { const u = getMediaSource(el); return u ? { url: u, kind: "video", el } : null; }
-    if (el.tagName === "AUDIO") { const u = getMediaSource(el); return u ? { url: u, kind: "audio", el } : null; }
-    if (el.tagName === "IMG" && el.naturalWidth > 160) {
-      const u = getMediaSource(el);
-      return u ? { url: u, kind: "image", el } : null;
-    }
-    return null;
-  };
-
-  // single source of truth for photo picking. a scope is a photo scope ONLY when:
-  //   - it has an <img.media-photo> (poster images on video posts use .thumbnail, not .media-photo)
-  //   - the scope does NOT contain <video> (so a video post's single <img.media-photo> poster — if ever —
-  //     and any video-time badge rule out the scope)
-  //   - the scope has no .video-time / .ckin__player / play-icon marker (unopened video thumbnail)
-  //   - the scope is NOT inside .reply, .webpage, avatar, sticker, reaction, etc.
-  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .bubble .bubble__media-container, .Message .album-item, .Message .media-inner";
-  // webA: the real photo is img.full-media; a video's poster is img.thumbnail and its stream is video.full-media
-  const PHOTO_IMG_SELECTOR = "img.media-photo, img.full-media";
-  // tweb wrappers/video.ts: posters are drawn by wrapPhoto and get `media-photo` too, so the img class alone
-  // can't tell photo from video. these markers are only ever added for video/gif/round media.
-  // webA: video wrappers are `.media-inner.dark` with a `.message-media-duration` badge (Video.tsx)
-  const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player, .media-inner.dark, .message-media-duration, .RoundVideo";
-  const scopeIsVideoLike = (scope) =>
-    scope.matches(VIDEO_MARKERS) || !!scope.querySelector(VIDEO_MARKERS);
-  const pickPhotoScopes = (root) =>
-    Array.from(root.querySelectorAll(PHOTO_SCOPE_SELECTOR)).filter((s) => {
-      if (s.closest(EXCLUDED_SCOPES)) return false;
-      const bubble = s.closest(".bubble, .Message");
-      if (!bubble || bubble.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
-      if (scopeIsVideoLike(s)) return false;
-      // if we're on an .attachment that itself holds .album-item children, defer to those (richer scopes)
-      if (s.matches(".attachment") && s.querySelector(".album-item")) return false;
-      // webA: a photo's `.media-inner` sits inside its `.album-item` — count the album-item only
-      if (s.matches(".media-inner") && s.closest(".album-item")) return false;
-      return !!s.querySelector(PHOTO_IMG_SELECTOR);
-    });
-  // diagnostic for the console: why each media scope in a post was rejected
-  const explainNoPhoto = (bubble) => {
-    const scopes = Array.from(bubble.querySelectorAll(PHOTO_SCOPE_SELECTOR));
-    if (!scopes.length) return `no media container (post classes: ${bubble.className})`;
-    return scopes.map((s, i) => {
-      const excl = s.closest(EXCLUDED_SCOPES);
-      if (excl) return `#${i} inside excluded .${excl.className}`;
-      if (scopeIsVideoLike(s)) return `#${i} video`;
-      const img = s.querySelector(PHOTO_IMG_SELECTOR);
-      if (!img) return `#${i} no loaded photo img`;
-      if (img.naturalWidth <= 100) return `#${i} photo still loading (${img.naturalWidth}px)`;
-      return `#${i} ok`;
-    }).join(", ");
-  };
-  const scopeToPhotoItem = (scope) => {
-    const img = Array.from(scope.querySelectorAll(PHOTO_IMG_SELECTOR))
-      // stripped blur placeholders also carry media-photo (photo.ts) but are ~40px; anything above 100px is the real image
-      .filter((i) => i.naturalWidth > 100 && !i.closest(EXCLUDED_SCOPES))
-      .sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0];
-    if (!img) return null;
-    const url = getMediaSource(img);
-    return url ? { url, kind: "image", el: img, key: mediaKey(url, img) } : null;
-  };
-
-  const resolveBubbleMediaAll = (bubble) => {
-    // kept for the auto-queue path which also handles video/audio; batch select uses pickPhotoScopes directly
-    const results = [], seen = new Set();
-    let skippedVideos = 0;
-    const push = (item) => { if (!item || seen.has(item.url)) return; seen.add(item.url); results.push(item); };
-    const attachments = Array.from(bubble.querySelectorAll(ATTACHMENT_CONTAINER))
-      .filter((s) => !s.closest(EXCLUDED_SCOPES));
-    if (!attachments.length) return { results, skippedVideos };
-    const scopes = [];
-    for (const att of attachments) {
-      const subs = att.querySelectorAll(".album-item");
-      if (subs.length) subs.forEach((s) => scopes.push(s));
-      else scopes.push(att);
-    }
-    for (const scope of scopes) {
-      const video = scope.querySelector("video");
-      if (video) { push(resolveMediaElement(video)); continue; }
-      const audio = scope.querySelector("audio");
-      if (audio) { push(resolveMediaElement(audio)); continue; }
-      if (looksLikeUnopenedVideo(scope)) { skippedVideos++; continue; }
-      const item = scopeToPhotoItem(scope);
-      if (item) push(item);
-    }
-    return { results, skippedVideos };
-  };
-
-  // ===== multi-select state =================================================
+  // --- trạng thái chọn / selection state ---
   const selectedBubbles = new Set();
   const selectedItems = new Map();
   let selectMode = false;
-  let autoQueueMode = loadStore("autoQueue", false);
+  let autoQueueMode = TEST_MODE ? false : loadStore("autoQueue", false);
   let lastClickedBubble = null;
-  const seenAutoQueueUrls = new Set();
-
-  const describeItem = (item) => {
-    const label = item.kind === "video" ? "Video" : item.kind === "audio"
-      ? (currentLang === "vi" ? "Âm thanh" : "Audio")
-      : (currentLang === "vi" ? "Ảnh" : "Image");
-    let name = "";
-    try { name = decodeURIComponent(new URL(item.url, location.href).pathname.split("/").pop() || ""); } catch {}
-    return name ? `${label} — ${name}` : label;
-  };
+  const seenAutoQueueKeys = new Set();
 
   const totalSelectedItems = () => {
     let n = 0;
@@ -990,16 +2416,26 @@
     return n;
   };
 
-  // paint a per-photo tick overlay anchored to the photo's own container (album-item-media or the img itself).
-  // overlay element lives in the item's own node so a 4-photo album shows 4 ticks, not 1 on the bubble.
+  const describeItem = (item) => {
+    const label = item.kind === "video" ? "Video"
+      : item.kind === "audio" ? (currentLang === "vi" ? "Âm thanh" : "Audio")
+      : (currentLang === "vi" ? "Ảnh" : "Image");
+    let name = "";
+    try {
+      const last = item.url.split("?")[0].split("/").pop();
+      name = decodeURIComponent(last || "");
+    } catch {}
+    return name ? `${label} — ${name}` : label;
+  };
+
   const paintTick = (item) => {
     const anchor = item.el?.closest(".album-item-media, .album-item, .attachment, .media-inner") || item.el?.parentElement;
     if (!anchor) return;
     if (getComputedStyle(anchor).position === "static") anchor.style.position = "relative";
-    anchor.classList.add("sakerly-sel-item");
-    if (!anchor.querySelector(":scope > .sakerly-tick")) {
+    anchor.classList.add("sk-sel-item");
+    if (!anchor.querySelector(":scope > .sk-tick")) {
       const tick = document.createElement("div");
-      tick.className = "sakerly-tick";
+      tick.className = "sk-tick";
       anchor.appendChild(tick);
     }
     item._tickAnchor = anchor;
@@ -1007,14 +2443,14 @@
   const removeTick = (item) => {
     const anchor = item._tickAnchor;
     if (!anchor) return;
-    anchor.classList.remove("sakerly-sel-item");
-    anchor.querySelector(":scope > .sakerly-tick")?.remove();
+    anchor.classList.remove("sk-sel-item");
+    anchor.querySelector(":scope > .sk-tick")?.remove();
     item._tickAnchor = null;
   };
 
   const markSelected = (bubble, on) => {
     if (!on) {
-      bubble.classList.remove("sakerly-sel");
+      bubble.classList.remove("sk-sel");
       const prev = selectedItems.get(bubble);
       if (prev) prev.forEach(removeTick);
       selectedBubbles.delete(bubble);
@@ -1022,35 +2458,34 @@
       updateSelectBar();
       return;
     }
-    // click path: pick photos directly via the strict scope resolver — never fall back to "largest img" (that caught video posters)
     const scopes = pickPhotoScopes(bubble);
-    const items = [];
-    const seen = new Set();
+    const items = [], seen = new Set();
     for (const sc of scopes) {
       const it = scopeToPhotoItem(sc);
       if (it && !seen.has(it.key)) { seen.add(it.key); items.push(it); }
     }
     if (!items.length) {
-      log.info(`nothing selectable in this post: ${explainNoPhoto(bubble)}`);
+      log.info("nothing selectable in this post");
       return;
     }
-    bubble.classList.add("sakerly-sel");
+    bubble.classList.add("sk-sel");
     selectedBubbles.add(bubble);
     selectedItems.set(bubble, items);
     items.forEach(paintTick);
     updateSelectBar();
   };
+
   const clearSelection = () => {
     for (const b of selectedBubbles) {
-      b.classList.remove("sakerly-sel");
+      b.classList.remove("sk-sel");
       selectedItems.get(b)?.forEach(removeTick);
     }
     selectedBubbles.clear();
     selectedItems.clear();
     updateSelectBar();
   };
+
   const rangeSelect = (from, to) => {
-    // tweb keeps other chats' bubble lists mounted; only walk the list both clicks belong to
     const container = from.closest(".bubbles-inner, .bubbles, .MessageList");
     if (!container || !container.contains(to)) return;
     const list = Array.from(container.querySelectorAll(BUBBLE_SELECTORS)).filter(bubbleHasMedia);
@@ -1060,688 +2495,41 @@
     for (let i = a; i <= b; i++) markSelected(list[i], true);
   };
 
-  // ===== draggable panels ===================================================
-  const makeDraggable = (panel, handle, storageKey) => {
-    const apply = () => {
-      try {
-        const pos = loadStore(storageKey, null);
-        if (!pos || typeof pos.left !== "number" || typeof pos.top !== "number") return;
-        const maxL = window.innerWidth - panel.offsetWidth - 4;
-        const maxT = window.innerHeight - panel.offsetHeight - 4;
-        panel.style.left = Math.max(4, Math.min(pos.left, maxL)) + "px";
-        panel.style.top = Math.max(4, Math.min(pos.top, maxT)) + "px";
-        panel.style.right = "auto";
-        panel.style.bottom = "auto";
-      } catch {}
-    };
-    requestAnimationFrame(apply);
-    let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
-    handle.style.cursor = "move";
-    handle.style.touchAction = "none";
-    handle.addEventListener("pointerdown", (e) => {
-      if (e.target.closest("button, select, input, a")) return;
-      dragging = true;
-      handle.setPointerCapture(e.pointerId);
-      const r = panel.getBoundingClientRect();
-      sl = r.left; st = r.top; sx = e.clientX; sy = e.clientY;
-      panel.style.left = sl + "px"; panel.style.top = st + "px";
-      panel.style.right = "auto"; panel.style.bottom = "auto";
-    });
-    handle.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      const l = sl + (e.clientX - sx), tp = st + (e.clientY - sy);
-      const maxL = window.innerWidth - panel.offsetWidth - 4;
-      const maxT = window.innerHeight - panel.offsetHeight - 4;
-      panel.style.left = Math.max(4, Math.min(l, maxL)) + "px";
-      panel.style.top = Math.max(4, Math.min(tp, maxT)) + "px";
-    });
-    const end = (e) => {
-      if (!dragging) return;
-      dragging = false;
-      try { handle.releasePointerCapture(e.pointerId); } catch {}
-      saveStore(storageKey, { left: parseFloat(panel.style.left), top: parseFloat(panel.style.top) });
-    };
-    handle.addEventListener("pointerup", end);
-    handle.addEventListener("pointercancel", end);
+  const isElementVisibleInViewport = (el) => {
+    if (!el || !el.offsetParent) return false;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
+    const r = el.getBoundingClientRect();
+    const visY = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    const visX = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+    return visY >= 40 && visX >= 40;
   };
-
-  // ===== UI build ===========================================================
-  const style = document.createElement("style");
-  style.textContent = `
-    :root {
-      --sk-bg: #ffffff; --sk-bg-head: #f6f9fc; --sk-fg: #0b1620;
-      --sk-muted: #475668; --sk-line: #d9e2ec;
-      --sk-track: #e3eaf2; --sk-track-hover: #d1dde8;
-      --sk-accent: #0b84ff; --sk-accent-fg: #ffffff; --sk-accent-soft: #e4f0ff;
-      --sk-ok: #10b981; --sk-err: #ef4444; --sk-radius: 14px;
-      --sk-shadow: 0 12px 40px rgba(10,20,40,.22), 0 2px 6px rgba(10,20,40,.08);
-    }
-    html.night, html.theme-dark {
-      --sk-bg: #1f2a37; --sk-bg-head: #273341; --sk-fg: #ffffff;
-      --sk-muted: #c5d1dd; --sk-line: #3a4a5c;
-      --sk-track: #334257; --sk-track-hover: #425269;
-      --sk-accent: #4aa5ff; --sk-accent-fg: #06111c; --sk-accent-soft: #1b3652;
-      --sk-shadow: 0 12px 40px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.4);
-    }
-    /* soft outline on the whole bubble just as a container hint */
-    .sakerly-sel {
-      outline: 2px dashed var(--sk-ok) !important; outline-offset: 2px;
-      border-radius: 8px;
-    }
-    /* per-media tick: dropped on each selected photo element (album item or single photo) */
-    .sakerly-sel-item {
-      position: relative;
-      outline: 4px solid var(--sk-ok) !important; outline-offset: -4px;
-      box-shadow: 0 0 0 4px rgba(34,197,94,.3), 0 0 20px 2px rgba(34,197,94,.55) !important;
-      border-radius: 6px;
-    }
-    .sakerly-tick {
-      position: absolute; top: 6px; left: 6px; z-index: 2;
-      width: 28px; height: 28px; border-radius: 50%;
-      background: var(--sk-ok); color: #04150a;
-      font: 900 16px/28px system-ui; text-align: center;
-      box-shadow: 0 2px 10px rgba(0,0,0,.5),
-                  inset 0 1px 0 rgba(255,255,255,.4);
-      pointer-events: none; user-select: none;
-    }
-    .sakerly-tick::before { content: "✓"; }
-
-    #sakerly-panel, #sakerly-select-bar {
-      box-sizing: border-box; position: fixed; z-index: 2147483646;
-      background: var(--sk-bg); color: var(--sk-fg);
-      border: 1px solid var(--sk-line); border-radius: var(--sk-radius);
-      box-shadow: var(--sk-shadow); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      display: flex; flex-direction: column; overflow: hidden;
-    }
-    #sakerly-panel * , #sakerly-select-bar * { box-sizing: border-box; }
-    #sakerly-panel [hidden], #sakerly-select-bar [hidden] { display: none !important; }
-
-    #sakerly-panel {
-      right: max(16px, env(safe-area-inset-right));
-      bottom: max(16px, env(safe-area-inset-bottom));
-      width: min(360px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
-    }
-    #sakerly-panel.empty { display: none; }
-    #sakerly-panel.collapsed .sakerly-task-list,
-    #sakerly-panel.collapsed .sakerly-panel-foot { display: none; }
-
-    #sakerly-select-bar {
-      right: max(16px, env(safe-area-inset-right));
-      top: max(16px, env(safe-area-inset-top));
-      width: min(320px, calc(100vw - 32px)); max-height: 70vh;
-    }
-    #sakerly-select-bar.collapsed { width: auto; }
-    #sakerly-select-bar.collapsed .sakerly-select-body { display: none; }
-
-    .sakerly-head {
-      display: flex; align-items: center; gap: 10px;
-      padding: 12px 14px; flex-shrink: 0;
-      background: var(--sk-bg-head);
-      border-bottom: 1px solid var(--sk-line);
-    }
-    .sakerly-head .sakerly-title {
-      flex: 1; min-width: 0; font-weight: 700; font-size: 13.5px;
-      color: var(--sk-fg);
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      display: flex; align-items: center; gap: 8px;
-    }
-    .sakerly-title .sakerly-logo {
-      width: 24px; height: 24px; flex-shrink: 0;
-      display: inline-flex; align-items: center; justify-content: center;
-      background: linear-gradient(135deg, #37aee2, #1e96c8);
-      border-radius: 50%;
-      box-shadow: 0 2px 6px rgba(55,174,226,.4);
-    }
-    .sakerly-title .sakerly-logo svg { width: 14px; height: 14px; display: block; }
-    .sakerly-head .sakerly-count {
-      background: var(--sk-accent-soft); color: var(--sk-accent);
-      border-radius: 10px; padding: 3px 10px;
-      font-weight: 700; font-size: 11.5px;
-      font-variant-numeric: tabular-nums;
-    }
-    .sakerly-icon-btn {
-      appearance: none; background: var(--sk-track); color: var(--sk-fg);
-      border: 0; width: 30px; height: 30px; padding: 0;
-      border-radius: 50%; font: 700 17px/1 system-ui; cursor: pointer;
-      display: inline-flex; align-items: center; justify-content: center;
-      transition: background .15s, color .15s;
-    }
-    .sakerly-icon-btn:hover { background: var(--sk-accent); color: var(--sk-accent-fg); }
-
-    #sakerly-panel .sakerly-task-list {
-      min-height: 0; overflow-y: auto; max-height: 50vh;
-      overscroll-behavior: contain;
-    }
-    #sakerly-panel .sakerly-task {
-      padding: 12px 14px; border-top: 1px solid var(--sk-line);
-    }
-    #sakerly-panel .sakerly-task:first-child { border-top: 0; }
-    #sakerly-panel .sakerly-task-head {
-      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
-    }
-    #sakerly-panel .filename {
-      flex: 1; min-width: 0; margin: 0; font-weight: 600; font-size: 13px;
-      color: var(--sk-fg);
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    #sakerly-panel .progress {
-      position: relative; height: 26px; background: var(--sk-track);
-      border-radius: 8px; overflow: hidden; margin-bottom: 6px;
-    }
-    #sakerly-panel .progress-fill {
-      position: absolute; inset: 0 auto 0 0; height: 100%;
-      background: var(--sk-accent); opacity: .9;
-      transition: width .2s;
-    }
-    #sakerly-panel .progress-label {
-      position: relative; text-align: center; margin: 0;
-      line-height: 26px; font-size: 12px; font-weight: 700;
-      color: var(--sk-fg); font-variant-numeric: tabular-nums;
-      text-shadow: 0 1px 2px rgba(255,255,255,.4);
-    }
-    html.night #sakerly-panel .progress-label,
-    html.theme-dark #sakerly-panel .progress-label {
-      text-shadow: 0 1px 2px rgba(0,0,0,.6);
-    }
-    #sakerly-panel [data-state="failed"] .progress-fill { background: var(--sk-err); opacity: .95; }
-    #sakerly-panel [data-state="completed"] .progress-fill,
-    #sakerly-panel [data-state="handedOff"] .progress-fill {
-      background: var(--sk-ok); opacity: .95;
-    }
-    #sakerly-panel .indeterminate .progress-fill {
-      width: 35% !important; animation: sk-progress 1.4s infinite ease-in-out;
-    }
-    @keyframes sk-progress { from { left: -35%; } to { left: 100%; } }
-    @media (prefers-reduced-motion: reduce) {
-      #sakerly-panel .indeterminate .progress-fill { animation: none; left: 32%; }
-    }
-    #sakerly-panel .sakerly-task-details {
-      margin: 0; color: var(--sk-muted); font-size: 12px; font-weight: 500;
-      font-variant-numeric: tabular-nums;
-    }
-    #sakerly-panel .sakerly-task-error {
-      margin: 6px 0 0; color: var(--sk-err); font-size: 12px; font-weight: 600;
-    }
-    #sakerly-panel .sakerly-task-actions {
-      display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px;
-    }
-    #sakerly-panel .sakerly-task button {
-      appearance: none; background: var(--sk-track); color: var(--sk-accent);
-      border: 0; font: inherit; font-size: 12px; font-weight: 600;
-      border-radius: 7px; padding: 6px 12px; cursor: pointer;
-      transition: background .15s;
-    }
-    #sakerly-panel .sakerly-task button:hover { background: var(--sk-track-hover); }
-    #sakerly-panel .sakerly-task [data-act="dismiss"] {
-      background: transparent; color: var(--sk-muted);
-      font-size: 20px; padding: 0 8px; line-height: 1;
-    }
-    #sakerly-panel .sakerly-task [data-act="dismiss"]:hover {
-      background: transparent; color: var(--sk-err);
-    }
-    #sakerly-panel .sakerly-panel-foot {
-      padding: 10px 14px; border-top: 1px solid var(--sk-line);
-      display: flex; align-items: center; gap: 8px;
-      font-size: 11.5px; color: var(--sk-muted); font-weight: 600;
-      background: var(--sk-bg-head);
-    }
-
-    #sakerly-select-bar .sakerly-select-body {
-      display: flex; flex-direction: column; min-height: 0;
-    }
-    #sakerly-select-bar .sakerly-hint {
-      padding: 10px 14px; font-size: 11.5px; color: var(--sk-muted);
-      line-height: 1.5; font-weight: 500;
-      border-bottom: 1px solid var(--sk-line);
-      background: var(--sk-bg-head);
-      display: flex; flex-direction: column; gap: 4px;
-    }
-    #sakerly-select-bar .sakerly-hint b { color: var(--sk-fg); font-weight: 700; }
-    #sakerly-select-bar .sakerly-hint-row { display: block; }
-    #sakerly-select-bar .sakerly-hint-keys {
-      margin-top: 4px; padding-top: 6px;
-      border-top: 1px dashed var(--sk-line);
-      font-size: 11px; opacity: .85;
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-    }
-    #sakerly-select-bar .sakerly-select-list {
-      overflow-y: auto; min-height: 0; max-height: 32vh;
-      background: var(--sk-bg);
-    }
-    #sakerly-select-bar .sakerly-select-row {
-      display: flex; align-items: center; gap: 6px;
-      padding: 8px 14px; border-bottom: 1px solid var(--sk-line);
-      font-size: 12px; color: var(--sk-fg); font-weight: 500;
-    }
-    #sakerly-select-bar .sakerly-select-row span {
-      flex: 1; min-width: 0;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    #sakerly-select-bar .sakerly-select-row button {
-      background: transparent; border: 0; color: var(--sk-muted);
-      cursor: pointer; font: 700 16px system-ui; padding: 0 6px;
-      transition: color .15s;
-    }
-    #sakerly-select-bar .sakerly-select-row button:hover { color: var(--sk-err); }
-
-    #sakerly-select-bar .sakerly-actions {
-      display: flex; gap: 6px; padding: 10px 14px;
-      border-top: 1px solid var(--sk-line);
-    }
-    #sakerly-select-bar .sakerly-actions:first-of-type { border-top: 0; }
-    #sakerly-select-bar .sakerly-actions button {
-      flex: 1; appearance: none; background: var(--sk-track);
-      color: var(--sk-fg); border: 0; border-radius: 8px;
-      padding: 9px 10px; font: 600 12px system-ui;
-      cursor: pointer; transition: background .15s, color .15s;
-    }
-    #sakerly-select-bar .sakerly-actions button:hover:not(:disabled) {
-      background: var(--sk-track-hover);
-    }
-    #sakerly-select-bar .sakerly-actions button.on {
-      background: var(--sk-accent); color: var(--sk-accent-fg);
-      box-shadow: 0 2px 8px rgba(11,132,255,.25);
-    }
-    #sakerly-select-bar .sakerly-actions button.danger.on {
-      background: linear-gradient(135deg, #16c074, #0ea968);
-      color: #ffffff !important;
-      font-weight: 800; letter-spacing: .3px;
-      box-shadow: 0 3px 10px rgba(16,185,129,.45),
-                  inset 0 1px 0 rgba(255,255,255,.25);
-      text-shadow: 0 1px 2px rgba(0,0,0,.35);
-      border: 1px solid rgba(255,255,255,.15);
-    }
-    #sakerly-panel .sakerly-panel-foot,
-    #sakerly-select-bar .sakerly-select-foot { justify-content: space-between; }
-    #sakerly-select-bar .sakerly-select-foot {
-      display: flex; align-items: center;
-      padding: 8px 14px; border-top: 1px solid var(--sk-line);
-      font-size: 11px; font-weight: 600; color: var(--sk-muted);
-      background: var(--sk-bg-head);
-    }
-    .sakerly-version {
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      font-weight: 500; opacity: .85;
-    }
-    #sakerly-select-bar .sakerly-dl-primary {
-      margin: 10px 14px 14px; padding: 11px;
-      background: var(--sk-accent); color: var(--sk-accent-fg);
-      border: 0; border-radius: 10px; font: 700 13px system-ui;
-      cursor: pointer; transition: filter .15s, transform .05s;
-      box-shadow: 0 3px 10px rgba(11,132,255,.3);
-    }
-    #sakerly-select-bar .sakerly-dl-primary:hover:not(:disabled) { filter: brightness(1.08); }
-    #sakerly-select-bar .sakerly-dl-primary:active:not(:disabled) { transform: translateY(1px); }
-    #sakerly-select-bar .sakerly-dl-primary:disabled {
-      background: var(--sk-track); color: var(--sk-muted);
-      box-shadow: none; cursor: default;
-    }
-
-    .sakerly-dl, ._sakerly_pinned_dl, .sakerly-queue {
-      appearance: none; cursor: pointer;
-    }
-    #sakerly-settings-modal[hidden] { display: none !important; }
-    #sakerly-settings-modal {
-      position: fixed; inset: 0; z-index: 2147483647;
-      display: flex; align-items: center; justify-content: center;
-      font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    }
-    #sakerly-settings-modal .sakerly-modal-backdrop {
-      position: absolute; inset: 0; background: rgba(0,0,0,.55);
-    }
-    #sakerly-settings-modal .sakerly-modal-card {
-      position: relative; z-index: 1;
-      width: min(420px, calc(100vw - 32px));
-      max-height: calc(100vh - 32px); overflow: auto;
-      background: var(--sk-bg); color: var(--sk-fg);
-      border: 1px solid var(--sk-line); border-radius: var(--sk-radius);
-      box-shadow: var(--sk-shadow);
-      display: flex; flex-direction: column;
-    }
-    #sakerly-settings-modal .sakerly-settings-body {
-      padding: 14px; display: flex; flex-direction: column; gap: 14px;
-    }
-    #sakerly-settings-modal .sakerly-field {
-      display: flex; flex-direction: column; gap: 6px;
-    }
-    #sakerly-settings-modal .sakerly-field-label {
-      font-size: 11.5px; font-weight: 700; color: var(--sk-muted);
-      text-transform: uppercase; letter-spacing: .4px;
-    }
-    #sakerly-settings-modal select,
-    #sakerly-settings-modal input[type="text"] {
-      appearance: none; background: var(--sk-track); color: var(--sk-fg);
-      border: 1px solid var(--sk-line); border-radius: 8px;
-      padding: 9px 12px; font: inherit; font-weight: 500;
-      transition: border-color .15s;
-    }
-    #sakerly-settings-modal select:focus,
-    #sakerly-settings-modal input[type="text"]:focus {
-      outline: none; border-color: var(--sk-accent);
-      background: var(--sk-bg);
-    }
-    #sakerly-settings-modal button {
-      appearance: none; background: var(--sk-track); color: var(--sk-fg);
-      border: 0; border-radius: 8px; padding: 8px 12px;
-      font: 600 12px system-ui; cursor: pointer;
-      transition: background .15s, color .15s;
-    }
-    #sakerly-settings-modal button:hover:not(:disabled) {
-      background: var(--sk-accent); color: var(--sk-accent-fg);
-    }
-    #sakerly-settings-modal button:disabled,
-    #sakerly-settings-modal select:disabled { opacity: .5; cursor: not-allowed; }
-    #sakerly-settings-modal .sakerly-settings-pickdir {
-      background: var(--sk-accent); color: var(--sk-accent-fg);
-    }
-    #sakerly-settings-modal .sakerly-settings-pickdir:hover:not(:disabled) { filter: brightness(1.08); }
-    #sakerly-settings-modal .sakerly-settings-cleardir {
-      background: transparent; color: var(--sk-err);
-      box-shadow: inset 0 0 0 1px var(--sk-line);
-    }
-    #sakerly-settings-modal .sakerly-settings-cleardir:hover {
-      background: var(--sk-err); color: #fff; box-shadow: none;
-    }
-    #sakerly-settings-modal .sakerly-folder-row {
-      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    }
-    #sakerly-settings-modal .sakerly-folder-name {
-      flex: 1; min-width: 0; padding: 8px 12px;
-      background: var(--sk-track); border-radius: 8px;
-      font-weight: 600; font-size: 12px;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    #sakerly-settings-modal .sakerly-folder-name.muted {
-      color: var(--sk-muted); font-weight: 500; font-style: italic;
-    }
-    #sakerly-settings-modal .sakerly-seq-row {
-      flex-direction: row; align-items: center; gap: 10px;
-    }
-    #sakerly-settings-modal .sakerly-seq-info {
-      flex: 1; text-transform: none; letter-spacing: normal;
-      font-weight: 600; color: var(--sk-fg); font-size: 12px;
-    }
-
-    .sakerly-queue-icon {
-      display: inline-flex; align-items: center; justify-content: center;
-      width: 1.4em; height: 1.4em; color: #22d175;
-    }
-    .sakerly-queue-icon svg { width: 100%; height: 100%; display: block; }
-    button.sakerly-queue { position: relative; }
-    button.sakerly-queue:hover .sakerly-queue-icon { color: #52e095; }
-    button.sakerly-queue.queued .sakerly-queue-icon { color: #4aa5ff; }
-  `;
-  document.head.appendChild(style);
-
-  // telegram paper-plane mark (used in both panel headers)
-  const TG_LOGO_SVG =
-    '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
-    '<path fill="#fff" d="M20.6 4.1 2.9 10.9c-1 .4-1 1.3 0 1.6l4.4 1.4 1.7 5.1c.2.6.5.9.9.9.3 0 .6-.1.9-.4l2.5-2.4 4.5 3.3c.8.5 1.5.2 1.7-.8l3-14c.3-1.2-.5-1.9-1.9-1.5zm-3.3 3.8-7.9 7.1-.3 3.1-1.4-4.2 9.1-6.5c.4-.3.8.2.5.5z"/>' +
-    '</svg>';
-
-  // download panel
-  const panel = document.createElement("section");
-  panel.id = "sakerly-panel";
-  panel.classList.add("empty");
-  panel.innerHTML = `
-    <div class="sakerly-head">
-      <div class="sakerly-title">
-        <span class="sakerly-logo">${TG_LOGO_SVG}</span>
-        <span class="sakerly-panel-title"></span>
-      </div>
-      <button type="button" class="sakerly-icon-btn sakerly-panel-clear" title=""><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M6 6l1 14a2 2 0 002 2h6a2 2 0 002-2l1-14M10 11v6M14 11v6"/></svg></button>
-      <button type="button" class="sakerly-icon-btn sakerly-panel-settings" title=""><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></button>
-      <button type="button" class="sakerly-icon-btn sakerly-panel-toggle" title="">–</button>
-    </div>
-    <div class="sakerly-task-list"></div>
-    <div class="sakerly-panel-foot">
-      <span>SakerLy</span>
-      <span class="sakerly-version">v${SCRIPT_VERSION}</span>
-    </div>
-  `;
-  document.body.appendChild(panel);
-  const panelToggle = panel.querySelector(".sakerly-panel-toggle");
-  panelToggle.onclick = () => {
-    const col = !panel.classList.contains("collapsed");
-    panel.classList.toggle("collapsed", col);
-    panelToggle.textContent = col ? "+" : "–";
-    panelToggle.title = col ? t("show") : t("hide");
-  };
-  makeDraggable(panel, panel.querySelector(".sakerly-head"), "panelPos");
-
-  // ===== settings modal ======================================================
-  const supportsDirPicker = typeof window.showDirectoryPicker === "function";
-  const settingsModal = document.createElement("div");
-  settingsModal.id = "sakerly-settings-modal";
-  settingsModal.hidden = true;
-  settingsModal.innerHTML = `
-    <div class="sakerly-modal-backdrop"></div>
-    <div class="sakerly-modal-card">
-      <div class="sakerly-head">
-        <div class="sakerly-title">
-          <span class="sakerly-logo">${TG_LOGO_SVG}</span>
-          <span class="sakerly-settings-title"></span>
-        </div>
-        <button type="button" class="sakerly-icon-btn sakerly-settings-close" title="">×</button>
-      </div>
-      <div class="sakerly-settings-body">
-        <label class="sakerly-field">
-          <span class="sakerly-field-label" data-key="lang"></span>
-          <select class="sakerly-lang-select">
-            <option value="vi">Tiếng Việt</option>
-            <option value="en">English</option>
-          </select>
-        </label>
-        <label class="sakerly-field">
-          <span class="sakerly-field-label" data-key="naming"></span>
-          <select class="sakerly-settings-naming">
-            <option value="original" data-key="namingOriginal"></option>
-            <option value="date" data-key="namingDate"></option>
-            <option value="seq" data-key="namingSeq"></option>
-            <option value="date_original" data-key="namingDateOriginal"></option>
-            <option value="seq_original" data-key="namingSeqOriginal"></option>
-          </select>
-        </label>
-        <label class="sakerly-field">
-          <span class="sakerly-field-label" data-key="prefix"></span>
-          <input type="text" class="sakerly-settings-prefix" maxlength="40" />
-        </label>
-        <div class="sakerly-field sakerly-seq-row">
-          <span class="sakerly-field-label sakerly-seq-info"></span>
-          <button type="button" class="sakerly-settings-resetseq"></button>
-        </div>
-        <div class="sakerly-field sakerly-seq-row">
-          <span class="sakerly-field-label sakerly-seq-info sakerly-downloaded-info"></span>
-          <button type="button" class="sakerly-settings-forget"></button>
-        </div>
-        <div class="sakerly-field">
-          <span class="sakerly-field-label" data-key="folder"></span>
-          <div class="sakerly-folder-row">
-            <span class="sakerly-folder-name"></span>
-            <button type="button" class="sakerly-settings-pickdir"></button>
-            <button type="button" class="sakerly-settings-cleardir"></button>
-          </div>
-        </div>
-        <label class="sakerly-field">
-          <span class="sakerly-field-label" data-key="subfolder"></span>
-          <select class="sakerly-settings-subfolder">
-            <option value="none" data-key="subfolderNone"></option>
-            <option value="date" data-key="subfolderDate"></option>
-            <option value="channel" data-key="subfolderChannel"></option>
-            <option value="date_channel" data-key="subfolderDateChannel"></option>
-            <option value="channel_date" data-key="subfolderChannelDate"></option>
-          </select>
-        </label>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(settingsModal);
-
-  const settingsCogBtn = panel.querySelector(".sakerly-panel-settings");
-  const settingsCloseBtn = settingsModal.querySelector(".sakerly-settings-close");
-  const settingsNaming = settingsModal.querySelector(".sakerly-settings-naming");
-  const settingsPrefix = settingsModal.querySelector(".sakerly-settings-prefix");
-  const settingsPickDir = settingsModal.querySelector(".sakerly-settings-pickdir");
-  const settingsClearDir = settingsModal.querySelector(".sakerly-settings-cleardir");
-  const settingsFolderName = settingsModal.querySelector(".sakerly-folder-name");
-  const settingsResetSeq = settingsModal.querySelector(".sakerly-settings-resetseq");
-  const settingsSeqInfo = settingsModal.querySelector(".sakerly-seq-info");
-  const settingsDownloadedInfo = settingsModal.querySelector(".sakerly-downloaded-info");
-  const settingsForget = settingsModal.querySelector(".sakerly-settings-forget");
-  const settingsSubfolder = settingsModal.querySelector(".sakerly-settings-subfolder");
-  const langSelect = settingsModal.querySelector(".sakerly-lang-select");
-  langSelect.value = currentLang;
-  langSelect.onchange = () => {
-    currentLang = langSelect.value;
-    saveStore("lang", currentLang);
-    refreshAllLabels();
-    refreshSettingsUI();
-  };
-
-  const refreshSettingsUI = () => {
-    settingsModal.querySelector(".sakerly-settings-title").textContent = t("settingsTitle");
-    settingsCloseBtn.title = t("close");
-    settingsModal.querySelectorAll("[data-key]").forEach((el) => { el.textContent = t(el.dataset.key); });
-    langSelect.value = currentLang;
-    settingsNaming.value = settings.naming;
-    settingsSubfolder.value = settings.subfolder || "none";
-    settingsSubfolder.disabled = !destDirName;
-    settingsPrefix.value = settings.prefix || "";
-    settingsPrefix.placeholder = t("prefixPlaceholder");
-    settingsFolderName.textContent = destDirName || t("folderNone");
-    settingsFolderName.classList.toggle("muted", !destDirName);
-    settingsPickDir.textContent = t("pickFolder");
-    settingsPickDir.disabled = !supportsDirPicker;
-    settingsPickDir.title = supportsDirPicker ? "" : t("folderUnsupported");
-    settingsClearDir.textContent = t("clearFolder");
-    settingsClearDir.hidden = !destDirName;
-    settingsResetSeq.textContent = t("resetSeq");
-    settingsSeqInfo.textContent = t("seqNow", { n: seqCounter });
-    settingsDownloadedInfo.textContent = t("downloadedCount", { n: downloadedKeys.size });
-    settingsForget.textContent = t("forgetDownloaded");
-    settingsForget.disabled = downloadedKeys.size === 0;
-    settingsCogBtn.title = t("settings");
-  };
-
-  const clearHistoryBtn = panel.querySelector(".sakerly-panel-clear");
-  const clearHistory = () => {
-    for (const task of [...downloadTasks.values()]) {
-      if (task.finished) dismissTask(task);
-    }
-  };
-  clearHistoryBtn.onclick = clearHistory;
-  settingsCogBtn.onclick = () => { settingsModal.hidden = false; refreshSettingsUI(); };
-  settingsCloseBtn.onclick = () => { settingsModal.hidden = true; };
-  settingsModal.querySelector(".sakerly-modal-backdrop").onclick = () => { settingsModal.hidden = true; };
-  // capture phase so Telegram's own Esc handler (closing the chat/viewer) doesn't fire while the modal is open
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !settingsModal.hidden) {
-      e.preventDefault(); e.stopPropagation();
-      settingsModal.hidden = true;
-    }
-  }, true);
-  settingsNaming.onchange = () => { settings.naming = settingsNaming.value; saveStore("settings", settings); refreshSettingsUI(); };
-  settingsSubfolder.onchange = () => { settings.subfolder = settingsSubfolder.value; saveStore("settings", settings); refreshSettingsUI(); };
-  settingsPrefix.oninput = () => { settings.prefix = settingsPrefix.value; saveStore("settings", settings); };
-  settingsResetSeq.onclick = () => { seqCounter = 1; saveStore("seq", 1); refreshSettingsUI(); };
-  settingsForget.onclick = () => {
-    downloadedKeys = new Set();
-    saveStore("downloaded", []);
-    seenAutoQueueUrls.clear();
-    queuedViewerUrls.clear();
-    refreshSettingsUI();
-  };
-  settingsPickDir.onclick = async () => {
-    if (!supportsDirPicker) return;
-    try {
-      const h = await window.showDirectoryPicker({ mode: "readwrite" });
-      destDirHandle = h; destDirName = h.name;
-      await idbSet("destDirHandle", h);
-      saveStore("destDirName", destDirName);
-      refreshSettingsUI();
-    } catch (e) { if (e?.name !== "AbortError") log.error("pickFolder: " + e.message); }
-  };
-  settingsClearDir.onclick = async () => {
-    destDirHandle = null; destDirName = "";
-    await idbDel("destDirHandle");
-    saveStore("destDirName", "");
-    refreshSettingsUI();
-  };
-
-  // select bar
-  const selectBar = document.createElement("section");
-  selectBar.id = "sakerly-select-bar";
-  selectBar.innerHTML = `
-    <div class="sakerly-head">
-      <div class="sakerly-title">
-        <span class="sakerly-logo">${TG_LOGO_SVG}</span>
-        <span class="sakerly-select-title"></span>
-      </div>
-      <span class="sakerly-count" id="sk-sel-count">0</span>
-      <button type="button" class="sakerly-icon-btn sakerly-select-settings" title=""><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></button>
-      <button type="button" class="sakerly-icon-btn sakerly-select-toggle" title="">–</button>
-    </div>
-    <div class="sakerly-select-body">
-      <div class="sakerly-hint" id="sk-hint"></div>
-      <div class="sakerly-select-list" id="sk-sel-list" hidden></div>
-      <div class="sakerly-actions">
-        <button type="button" id="sk-mode-btn"></button>
-        <button type="button" id="sk-auto-btn" class="danger"></button>
-      </div>
-      <div class="sakerly-actions">
-        <button type="button" id="sk-all-btn"></button>
-        <button type="button" id="sk-clear-btn"></button>
-      </div>
-      <button type="button" id="sk-dl-btn" class="sakerly-dl-primary"></button>
-      <div class="sakerly-select-foot">
-        <span>SakerLy</span>
-        <span class="sakerly-version">v${SCRIPT_VERSION}</span>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(selectBar);
-  const selSettingsBtn = selectBar.querySelector(".sakerly-select-settings");
-  selSettingsBtn.onclick = () => { settingsModal.hidden = false; refreshSettingsUI(); };
-  const selToggle = selectBar.querySelector(".sakerly-select-toggle");
-  selToggle.onclick = () => {
-    const col = !selectBar.classList.contains("collapsed");
-    selectBar.classList.toggle("collapsed", col);
-    selToggle.textContent = col ? "+" : "–";
-    selToggle.title = col ? t("show") : t("hide");
-  };
-  makeDraggable(selectBar, selectBar.querySelector(".sakerly-head"), "selectBarPos");
-
-  const selModeBtn = selectBar.querySelector("#sk-mode-btn");
-  const selAutoBtn = selectBar.querySelector("#sk-auto-btn");
-  const selAllBtn = selectBar.querySelector("#sk-all-btn");
-  const selClearBtn = selectBar.querySelector("#sk-clear-btn");
-  const selDlBtn = selectBar.querySelector("#sk-dl-btn");
-  const selCount = selectBar.querySelector("#sk-sel-count");
-  const selList = selectBar.querySelector("#sk-sel-list");
-  const selHint = selectBar.querySelector("#sk-hint");
-  const selTitle = selectBar.querySelector(".sakerly-select-title");
 
   const updateSelectBar = () => {
+    if (!selectBar) return;
+    // giữ vị trí scroll body khi vẽ lại list — không bị "đẩy scroll" (bug 2.1.0)
+    const bodyEl = selectBar.querySelector(".sk-select-body");
+    const stick = bodyEl ? bodyEl.scrollTop : 0;
     const count = totalSelectedItems();
     selCount.textContent = String(count);
+    selCount.dataset.zero = count === 0 ? "1" : "";
     selTitle.textContent = t("selectTitle");
     selHint.innerHTML =
-      `<div class="sakerly-hint-row">${t("hintPhoto")}</div>` +
-      `<div class="sakerly-hint-row">${t("hintVideo")}</div>` +
-      `<div class="sakerly-hint-row sakerly-hint-keys">${t("hintKeys")}</div>`;
-    selModeBtn.textContent = t("selectMode") + (selectMode ? " ✓" : "");
+      `<div>${t("hintPhoto")}</div><div>${t("hintVideo")}</div><div class="keys">${t("hintKeys")}</div>`;
+    selModeBtn.textContent = t("selectMode");
     selModeBtn.classList.toggle("on", selectMode);
-    selAutoBtn.textContent = autoQueueMode ? t("autoQueueOn") : t("autoQueue");
+    selAutoBtn.textContent = t("autoQueue");
     selAutoBtn.classList.toggle("on", autoQueueMode);
     selAllBtn.textContent = t("selectAll");
     selClearBtn.textContent = t("clearSelection");
-    selDlBtn.textContent = t("downloadSelected", { count });
+    selDlBtn.innerHTML =
+      `<span class="sk-btn-ic">${DL_ICON_SVG}</span><span>${t("downloadSelected", { count })}</span>`;
     selDlBtn.disabled = count === 0;
     selList.innerHTML = "";
     for (const [bubble, items] of selectedItems) {
       for (const item of items) {
         const row = document.createElement("div");
-        row.className = "sakerly-select-row";
+        row.className = "sk-select-row";
         const span = document.createElement("span");
         span.textContent = describeItem(item);
         span.title = item.url;
@@ -1751,7 +2539,7 @@
           removeTick(item);
           const rem = selectedItems.get(bubble).filter((x) => x !== item);
           if (rem.length) selectedItems.set(bubble, rem);
-          else { bubble.classList.remove("sakerly-sel"); selectedBubbles.delete(bubble); selectedItems.delete(bubble); }
+          else { bubble.classList.remove("sk-sel"); selectedBubbles.delete(bubble); selectedItems.delete(bubble); }
           updateSelectBar();
         };
         row.append(span, rm);
@@ -1759,165 +2547,105 @@
       }
     }
     selList.hidden = selectedItems.size === 0;
+    if (bodyEl) bodyEl.scrollTop = stick;
   };
 
-  selModeBtn.onclick = () => { selectMode = !selectMode; updateSelectBar(); };
-  selAutoBtn.onclick = () => {
-    autoQueueMode = !autoQueueMode;
-    saveStore("autoQueue", autoQueueMode);
-    if (autoQueueMode) { seenAutoQueueUrls.clear(); log.info("auto-queue on"); }
-    updateSelectBar();
-  };
-  selClearBtn.onclick = clearSelection;
-  // tweb keeps off-screen bubbles mounted (virtual scroll) — relying on the bubble's rect alone catches
-  // the cached ones too. Instead walk every real post-image element in the document, filter by the IMAGE's
-  // own geometry inside the viewport, then group what survives back to its bubble.
-  const isElementVisibleInViewport = (el) => {
-    if (!el || !el.offsetParent) return false;
-    const cs = getComputedStyle(el);
-    if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") return false;
-    const r = el.getBoundingClientRect();
-    const vw = window.innerWidth, vh = window.innerHeight;
-    const visY = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
-    const visX = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
-    return visY >= 40 && visX >= 40;
-  };
-  // "Select all visible": additive — scroll, press again, and the new on-screen photos join the existing
-  // selection. Only photos currently on screen are added; "Clear" resets. Deduped by media identity.
-  selAllBtn.onclick = () => {
-    const seen = new Set();
-    for (const items of selectedItems.values()) for (const it of items) seen.add(it.key);
-    const scopes = pickPhotoScopes(document).filter((sc) => {
-      const img = sc.querySelector(PHOTO_IMG_SELECTOR);
-      return img && isElementVisibleInViewport(img);
-    });
-    let added = 0;
-    for (const sc of scopes) {
-      const item = scopeToPhotoItem(sc);
-      if (!item || seen.has(item.key)) continue;
-      seen.add(item.key);
-      const bubble = sc.closest(".bubble, .Message");
-      if (!bubble) continue;
-      const list = selectedItems.get(bubble) || [];
-      list.push(item);
-      selectedItems.set(bubble, list);
-      selectedBubbles.add(bubble);
-      bubble.classList.add("sakerly-sel");
-      paintTick(item);
-      added++;
-    }
-    log.info(`select-visible: +${added} (total ${totalSelectedItems()})`);
-    updateSelectBar();
-  };
-  // brief inline feedback on the download button (there is no toast system)
   const flashDlButton = (text) => {
     selDlBtn.textContent = text;
     clearTimeout(flashDlButton.timer);
     flashDlButton.timer = setTimeout(updateSelectBar, 2500);
   };
-  selDlBtn.onclick = () => {
-    const items = [...selectedItems.values()].flat();
-    if (!items.length) return;
-    let queued = 0, skipped = 0;
-    for (const it of items) {
-      if (downloadedKeys.has(it.key)) { skipped++; continue; }
-      downloadMedia(it.url, it.kind, { batch: true, silent: true, mediaKey: it.key });
-      queued++;
-    }
-    log.info(`batch: queued ${queued}, skipped ${skipped} already downloaded`);
-    clearSelection();
-    if (skipped) flashDlButton(t("skippedDownloaded", { n: skipped }));
-  };
 
-  // auto-queue post plan. tweb (chat/bubbles.ts) opens the viewer with the clicked bubble's media items
-  // in DOM order — `.album-item`, else `.bubble__media-container` / `.attachment` — and "next" walks them
-  // in that order before leaving the post. so at click time we already know how many videos lie ahead.
+  // ===========================================================================
+  // SECTION 18: auto-queue video — đi hết post rồi săn tiếp post/reply kế tiếp
+  // ===========================================================================
   let armedPost = null;
-  const POST_ITEM_SELECTOR = ".album-item, .bubble__media-container, .attachment";
+  const POST_ITEM_SELECTOR = ".album-item, .bubble__media-container, .attachment, .media-inner";
+  const AUTO_QUEUE_HUNT_SLIDES = 10; // số slide liên tiếp không có video mới thì dừng
   const postMediaItems = (bubble) => {
     const albumItems = bubble.querySelectorAll(".album-item");
-    const items = albumItems.length ? Array.from(albumItems) : Array.from(bubble.querySelectorAll(".bubble__media-container, .attachment")).slice(0, 1);
+    const items = albumItems.length
+      ? Array.from(albumItems)
+      : Array.from(bubble.querySelectorAll(".bubble__media-container, .attachment, .media-inner"))
+        .filter((el) => !el.closest(".album-item"))
+        .slice(0, 1);
     return items.filter((el) => !el.closest(EXCLUDED_SCOPES));
   };
-  document.addEventListener("click", (e) => {
+  const armPostFromClick = (e) => {
     if (!autoQueueMode || selectMode) return;
     const item = e.target.closest?.(POST_ITEM_SELECTOR);
-    const bubble = item?.closest(".bubble");
+    const bubble = item?.closest(".bubble, .Message");
     if (!item || !bubble || item.closest(EXCLUDED_SCOPES)) return;
     const items = postMediaItems(bubble);
     const startIdx = Math.max(0, items.findIndex((el) => el === item || el.contains(item) || item.contains(el)));
     const ahead = items.slice(startIdx);
     armedPost = {
-      total: items.length,
-      startIdx,
+      total: items.length, startIdx,
       videoCount: ahead.filter(scopeIsVideoLike).length,
-      videosSeen: 0,
-      step: 0,
-      armedAt: Date.now(),
+      videosSeen: 0, step: 0, noNewStreak: 0, armedAt: Date.now(),
     };
-    seenAutoQueueUrls.clear(); // reopening the same post must walk it again
-    log.info(`auto-queue: post has ${armedPost.videoCount} video(s) from the clicked item on`);
-  }, true);
-
-  // click handler for select mode. we intercept any click inside a bubble that has at least one
-  // real photo scope — the strict picker is applied inside markSelected, so a click on a video post
-  // short-circuits with a log line rather than silently doing nothing.
-  const bubbleIsSelectable = (b) => {
-    if (!b || b.matches(EXCLUDED_BUBBLE_CLASSES)) return false;
-    return !!b.querySelector(PHOTO_SCOPE_SELECTOR);
-  };
-  document.addEventListener("click", (e) => {
-    if (!selectMode) return;
-    const b = findBubble(e.target);
-    if (!b || !bubbleIsSelectable(b)) return;
-    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-    if (e.shiftKey && lastClickedBubble) rangeSelect(lastClickedBubble, b);
-    else markSelected(b, !selectedBubbles.has(b));
-    lastClickedBubble = b;
-  }, true);
-
-  // shortcuts
-  window.addEventListener("keydown", (e) => {
-    if (!e.ctrlKey || !e.shiftKey) return;
-    const k = e.key.toLowerCase();
-    if (k === "m") { e.preventDefault(); selectMode = !selectMode; updateSelectBar(); }
-    else if (k === "a") { e.preventDefault(); selAutoBtn.click(); }
-    else if (k === "d") { e.preventDefault(); selDlBtn.onclick(); }
-  });
-
-  const refreshAllLabels = () => {
-    panelToggle.title = panel.classList.contains("collapsed") ? t("show") : t("hide");
-    selToggle.title = selectBar.classList.contains("collapsed") ? t("show") : t("hide");
-    updatePanel();
-    for (const task of downloadTasks.values()) renderTask(task);
-    updateSelectBar();
-    document.querySelectorAll("button.sakerly-dl, button._sakerly_pinned_dl").forEach((b) => {
-      const label = t(b.matches("._sakerly_pinned_dl:disabled") ? "loadingMedia" : "download");
-      b.title = label; b.setAttribute("aria-label", label);
-    });
-    document.querySelectorAll("button.sakerly-queue").forEach((b) => {
-      b.title = t("topbarQueue"); b.setAttribute("aria-label", t("topbarQueue"));
-    });
-    if (clearHistoryBtn) clearHistoryBtn.title = t("clearHistory");
-    if (settingsCogBtn) settingsCogBtn.title = t("settings");
-    if (selSettingsBtn) selSettingsBtn.title = t("settings");
-    if (!settingsModal.hidden) refreshSettingsUI();
+    seenAutoQueueKeys.clear();
+    log.info(`auto-queue: post có ${armedPost.videoCount} video phía trước`);
   };
 
-  // ===== WebK refresh =======================================================
-  // tray-plus icon matches the stroke weight of TG's own topbar glyphs (share/download/retry/zoom/close)
-  const QUEUE_ICON_SVG =
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ' +
-    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<path d="M5 15v4h14v-4"/><path d="M12 4v10"/><path d="M8 10l4 4 4-4"/><circle cx="18" cy="6" r="3" fill="currentColor" stroke="none"/>' +
-    '<path d="M18 4.5v3M16.5 6h3" stroke="#0a1420" stroke-width="1.6"/></svg>';
+  const viewerOpen = () => {
+    if (isWebA) return !!document.getElementById("MediaViewer");
+    return !!document.querySelector(".media-viewer-whole");
+  };
+
+  const processAutoQueue = () => {
+    if (!autoQueueMode) return;
+    if (!viewerOpen()) { armedPost = null; return; }
+    const r = isWebA ? resolveViewerWebAMedia() : resolveViewerWebKMedia();
+    if (!r) return;
+    const mk = mediaKey(r.url);
+    if (seenAutoQueueKeys.has(mk)) return;
+    seenAutoQueueKeys.add(mk);
+    if (armedPost && armedPost.step === 0 && Date.now() - armedPost.armedAt > 5000) armedPost = null;
+    const post = armedPost;
+    if (post) post.step++;
+    let queuedNew = false;
+    if (r.kind !== "video") {
+      log.info("auto-queue: slide ảnh, bỏ qua");
+    } else {
+      if (post) post.videosSeen++;
+      if (downloadedKeys.has(mk)) log.info("auto-queue: đã tải rồi, bỏ qua");
+      else {
+        queuedViewerKeys.add(mk);
+        downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
+        queuedNew = true;
+        log.info("auto-queue: video");
+      }
+    }
+    if (!post) return;
+    const lastSlideOfPost = post.startIdx + post.step >= post.total;
+    if (lastSlideOfPost) {
+      if (!post.doneFlashed) {
+        post.doneFlashed = true;
+        flashDlButton(t("postVideosDone", { n: post.videosSeen }));
+      }
+      // hết post → tiếp tục săn video ở các post/reply kế tiếp cho tới khi hết
+      // slide mới (hoặc N slide liên tiếp không tìm thấy video mới)
+      post.noNewStreak = queuedNew ? 0 : (post.noNewStreak || 0) + 1;
+      if (post.noNewStreak >= AUTO_QUEUE_HUNT_SLIDES) {
+        log.info(`auto-queue: dừng sau ${post.step} slide (${post.videosSeen} video)`);
+        armedPost = null;
+        return;
+      }
+    }
+    setTimeout(autoAdvanceViewer, 400);
+  };
+
+  // ===========================================================================
+  // SECTION 19: gắn nút vào WebK
+  // ===========================================================================
   const makeQueueButton = (extraClass) => {
     const btn = document.createElement("button");
-    btn.className = `btn-icon sakerly-queue${extraClass ? " " + extraClass : ""}`;
+    btn.className = `btn-icon sk-queue-btn${extraClass ? " " + extraClass : ""}`;
     btn.type = "button";
     btn.title = t("topbarQueue");
     btn.setAttribute("aria-label", t("topbarQueue"));
-    btn.innerHTML = `<span class="sakerly-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
+    btn.innerHTML = `<span class="sk-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
     btn.onclick = (e) => {
       e.stopPropagation();
       queueCurrentWebKMedia();
@@ -1928,60 +2656,24 @@
   };
 
   const refreshWebK = () => {
+    keepPanelsOnTop(); // an toàn: kéo panel về body nếu bị detached
     refreshWebKGlyph();
-
-    // viewer closed → the post walk is over
-    if (armedPost && armedPost.step > 0 && !document.querySelector(".media-viewer-whole")) armedPost = null;
-
-    // auto-queue: videos only. the walk is scoped to the post the user clicked (see armPostFromClick):
-    // queue each video slide, pass over photo slides, and stop once every video of that post was seen
-    // or the post's last item is reached — tweb's "next" would otherwise run through the whole chat.
-    if (autoQueueMode) {
-      const r = resolveViewerWebKMedia();
-      const mk = r && mediaKey(r.url);
-      if (r && !seenAutoQueueUrls.has(mk)) {
-        seenAutoQueueUrls.add(mk);
-        // a click older than a few seconds didn't open this viewer — don't apply its post plan
-        if (armedPost && armedPost.step === 0 && Date.now() - armedPost.armedAt > 5000) armedPost = null;
-        const post = armedPost;
-        if (post) post.step++;
-        if (r.kind !== "video") log.info("auto-queue: photo slide, skipped");
-        else {
-          if (post) post.videosSeen++;
-          if (downloadedKeys.has(mk)) log.info("auto-queue: skip video, already downloaded");
-          else {
-            queuedViewerUrls.add(mk);
-            downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
-            log.info("auto-queue: video");
-          }
-        }
-        if (post) {
-          const lastSlideOfPost = post.startIdx + post.step >= post.total;
-          if (post.videosSeen >= post.videoCount || lastSlideOfPost) {
-            log.info(`auto-queue: post done, ${post.videosSeen}/${post.videoCount} videos`);
-            flashDlButton(t("postVideosDone", { n: post.videosSeen }));
-            armedPost = null;
-          } else setTimeout(autoAdvanceViewer, 400);
-        }
-        // no armed post (viewer opened some other way): queue this one item, never walk the chat
-      }
-    }
+    processAutoQueue();
 
     // pinned audio
     const pinned = document.querySelector(".pinned-audio");
     const pinnedUtils = pinned?.querySelector(".pinned-container-wrapper-utils");
     if (pinnedUtils) {
-      let b = pinnedUtils.querySelector("._sakerly_pinned_dl");
+      let b = pinnedUtils.querySelector(".sk-pinned-dl");
       if (!b) {
         b = document.createElement("button");
-        b.className = "btn-icon tgico-download _sakerly_pinned_dl";
+        b.className = "btn-icon tgico-download sk-pinned-dl";
         b.innerHTML = createWebKDlIcon(true);
         b.type = "button";
         b.onclick = (ev) => {
           ev.stopPropagation();
           const m = getPinnedMedia();
-          if (!m) return;
-          downloadMedia(m.url, m.kind);
+          if (m) downloadMedia(m.url, m.kind);
         };
         pinnedUtils.appendChild(b);
       }
@@ -1996,14 +2688,12 @@
     if (stories) {
       const makeBtn = () => {
         const b = document.createElement("button");
-        b.className = "btn-icon rp sakerly-dl";
+        b.className = "btn-icon rp sk-dl-btn";
         b.innerHTML = `${createWebKDlIcon()}<div class="c-ripple"></div>`;
         b.type = "button";
-        b.title = t("download");
-        b.setAttribute("aria-label", t("download"));
+        b.title = t("download"); b.setAttribute("aria-label", t("download"));
         b.onclick = () => {
-          const v = stories.querySelector("video.media-video");
-          const vSrc = getMediaSource(v);
+          const vSrc = getMediaSource(stories.querySelector("video.media-video"));
           if (vSrc) return downloadMedia(vSrc, "video");
           const iSrc = stories.querySelector("img.media-photo")?.src;
           if (iSrc) downloadMedia(iSrc, "image");
@@ -2011,9 +2701,9 @@
         return b;
       };
       const h = stories.querySelector("[class*='_ViewerStoryHeaderRight']");
-      if (h && !h.querySelector(".sakerly-dl")) h.prepend(makeBtn());
+      if (h && !h.querySelector(".sk-dl-btn")) h.prepend(makeBtn());
       const f = stories.querySelector("[class*='_ViewerStoryFooterRight']");
-      if (f && !f.querySelector(".sakerly-dl")) f.prepend(makeBtn());
+      if (f && !f.querySelector(".sk-dl-btn")) f.prepend(makeBtn());
     }
 
     // media viewer
@@ -2023,62 +2713,69 @@
     const buttons = viewer.querySelector(".media-viewer-topbar .media-viewer-buttons");
     if (!asp || !buttons) return;
 
-    // force-visible native buttons (noforwards channels hide them)
+    // kênh chặn lưu → hiện lại nút native bị ẩn / force-show hidden natives
     for (const b of getWebKDlButtons(buttons)) {
       if (!b.disabled && b.getAttribute("aria-disabled") !== "true") b.classList.remove("hide");
     }
-
     const nativeBtns = getWebKDlButtons(buttons).filter(isUsableBtn);
-    if (nativeBtns.length) buttons.querySelectorAll("button.sakerly-dl").forEach((b) => b.remove());
-    const hasDl = nativeBtns.length > 0 || buttons.querySelector("button.sakerly-dl");
+    if (nativeBtns.length) buttons.querySelectorAll("button.sk-dl-btn").forEach((b) => b.remove());
+    const hasDl = nativeBtns.length > 0 || !!buttons.querySelector("button.sk-dl-btn");
+
+    const makeViewerDlBtn = (cls) => {
+      const b = document.createElement("button");
+      b.className = `btn-icon ${cls} sk-dl-btn`;
+      b.innerHTML = createWebKDlIcon(true);
+      b.type = "button";
+      b.title = t("download"); b.setAttribute("aria-label", t("download"));
+      b.onclick = downloadCurrentWebKMedia;
+      return b;
+    };
 
     if (asp.querySelector(".ckin__player")) {
       const controls = asp.querySelector(".default__controls.ckin__controls");
-      if (controls && !controls.querySelector(".sakerly-dl")) {
+      if (controls && !controls.querySelector(".sk-dl-btn")) {
         const right = controls.querySelector(".bottom-controls .right-controls");
-        const b = document.createElement("button");
-        b.className = "btn-icon default__button tgico-download sakerly-dl";
-        b.innerHTML = createWebKDlIcon();
-        b.type = "button";
-        b.title = t("download"); b.setAttribute("aria-label", t("download"));
-        b.onclick = downloadCurrentWebKMedia;
-        right?.prepend(b);
-        if (!controls.querySelector(".sakerly-queue")) right?.prepend(makeQueueButton("default__button"));
+        right?.prepend(makeViewerDlBtn("default__button tgico-download"));
+        if (!controls.querySelector(".sk-queue-btn")) right?.prepend(makeQueueButton("default__button"));
       }
     } else if (asp.querySelector("video") && !hasDl) {
-      const b = document.createElement("button");
-      b.className = "btn-icon tgico-download sakerly-dl";
-      b.innerHTML = createWebKDlIcon(true);
-      b.type = "button";
-      b.title = t("download"); b.setAttribute("aria-label", t("download"));
-      b.onclick = downloadCurrentWebKMedia;
-      buttons.prepend(b);
-      if (!buttons.querySelector(".sakerly-queue")) buttons.prepend(makeQueueButton());
+      buttons.prepend(makeViewerDlBtn("tgico-download"));
+      if (!buttons.querySelector(".sk-queue-btn")) buttons.prepend(makeQueueButton());
     } else if (!hasDl) {
       const thumb = asp.querySelector("img.thumbnail");
-      if (!thumb?.src) return;
-      const b = document.createElement("button");
-      b.className = "btn-icon tgico-download sakerly-dl";
-      b.innerHTML = createWebKDlIcon(true);
-      b.type = "button";
-      b.title = t("download"); b.setAttribute("aria-label", t("download"));
-      b.onclick = downloadCurrentWebKMedia;
-      buttons.prepend(b);
+      if (thumb?.src) buttons.prepend(makeViewerDlBtn("tgico-download"));
     }
-    // queue button rides the topbar for every media the viewer resolves — regardless of whether TG's own download button is present
-    if (resolveViewerWebKMedia() && !buttons.querySelector(".sakerly-queue")) {
+    if (resolveViewerWebKMedia() && !buttons.querySelector(".sk-queue-btn")) {
       buttons.prepend(makeQueueButton());
     }
   };
 
-  // ===== WebA refresh =======================================================
+  // ===========================================================================
+  // SECTION 20: gắn nút vào WebA
+  // ===========================================================================
+  const getWebADlButtons = (c) =>
+    Array.from(c.querySelectorAll("button")).filter(
+      (b) => !b.classList.contains("sk-dl-btn") &&
+        (b.querySelector(".icon-download") || b.title === "Download" ||
+          b.getAttribute("aria-label") === "Download") && isUsableBtn(b)
+    );
+
+  const downloadCurrentWebAMedia = () => {
+    // resolver chung (ưu tiên video, fallback ảnh) + log rõ khi chưa đọc được nguồn
+    const r = resolveViewerWebAMedia();
+    if (r) downloadMedia(r.url, r.kind);
+    else log.warn("WebA viewer: chưa đọc được nguồn media — thử bấm phát video rồi tải lại");
+  };
+
   const refreshWebA = () => {
+    keepPanelsOnTop(); // panel phải nằm trong dialog top-layer của viewer
+    processAutoQueue();
     const story = document.getElementById("StoryViewer");
     if (story) {
       const header = story.querySelector(".GrsJNw3y") || story.querySelector(".DropdownMenu")?.parentNode;
-      if (header && !header.querySelector(".sakerly-dl") && !getWebADlButtons(header).length) {
+      if (header && !header.querySelector(".sk-dl-btn") && !getWebADlButtons(header).length) {
         const b = document.createElement("button");
-        b.className = "Button TkphaPyQ tiny translucent-white round sakerly-dl";
+        b.className = "Button TkphaPyQ tiny translucent-white round sk-dl-btn";
         b.innerHTML = '<i class="icon icon-download" aria-hidden="true"></i>';
         b.type = "button";
         b.title = t("download"); b.setAttribute("aria-label", t("download"));
@@ -2101,7 +2798,7 @@
     if (!getMediaSource(v) && !getMediaSource(i)) return;
     const makeBtn = () => {
       const b = document.createElement("button");
-      b.className = "Button smaller translucent-white round sakerly-dl";
+      b.className = "Button smaller translucent-white round sk-dl-btn";
       b.innerHTML = '<i class="icon icon-download" aria-hidden="true"></i>';
       b.type = "button";
       b.title = t("download"); b.setAttribute("aria-label", t("download"));
@@ -2109,50 +2806,168 @@
       return b;
     };
     if (getWebADlButtons(actions).length) {
-      actions.querySelectorAll("button.sakerly-dl").forEach((b) => b.remove());
-    } else if (!actions.querySelector("button.sakerly-dl")) {
+      actions.querySelectorAll("button.sk-dl-btn").forEach((b) => b.remove());
+    } else if (!actions.querySelector("button.sk-dl-btn")) {
       actions.prepend(makeBtn());
     }
+    // nút hàng đợi trong viewer WebA (ngang hàng WebK)
+    if (resolveViewerWebAMedia() && !actions.querySelector("button.sk-queue-btn")) {
+      actions.prepend(makeWebAQueueButton());
+    }
     const controls = media.querySelector(".VideoPlayerControls .buttons");
-    if (v && controls && !controls.querySelector("button.sakerly-dl")) {
+    if (v && controls && !controls.querySelector("button.sk-dl-btn")) {
       const sp = controls.querySelector(".spacer");
       if (sp) sp.after(makeBtn()); else controls.appendChild(makeBtn());
     }
+    if (v && controls && !controls.querySelector("button.sk-queue-btn")) {
+      const sp = controls.querySelector(".spacer");
+      if (sp) sp.after(makeWebAQueueButton()); else controls.appendChild(makeWebAQueueButton());
+    }
   };
 
-  // ===== app detection + observer ===========================================
-  const isWebK = location.hostname === "webk.telegram.org" || location.pathname.startsWith("/k/");
-  const isWebA = location.hostname === "webz.telegram.org" || location.pathname.startsWith("/a/");
+  // ===========================================================================
+  // SECTION 21: boot — observer, phím tắt, click handlers
+  // ===========================================================================
+  const isWebK = typeof location !== "undefined" &&
+    (location.hostname === "webk.telegram.org" || location.pathname.startsWith("/k/"));
+  const isWebA = typeof location !== "undefined" &&
+    (location.hostname === "webz.telegram.org" || location.pathname.startsWith("/a/"));
   const refreshApp = isWebK ? refreshWebK : isWebA ? refreshWebA : null;
 
-  refreshAllLabels();
+  const boot = () => {
+    buildUI();
+    refreshAllLabels();
 
-  if (refreshApp) {
-    const roots = isWebK
-      ? ".media-viewer-whole, #stories-viewer, .pinned-audio, audio-element"
-      : "#MediaViewer, #StoryViewer";
-    let pending;
-    const schedule = () => {
-      if (pending) return;
-      pending = setTimeout(() => { pending = null; refreshApp(); }, 100);
+    // click chọn ảnh (select mode)
+    document.addEventListener("click", (e) => {
+      if (!selectMode) return;
+      const b = findBubble(e.target);
+      if (!b || !b.querySelector(PHOTO_SCOPE_SELECTOR)) return;
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      if (e.shiftKey && lastClickedBubble) rangeSelect(lastClickedBubble, b);
+      else markSelected(b, !selectedBubbles.has(b));
+      lastClickedBubble = b;
+    }, true);
+
+    // arm auto-queue trước khi viewer mở
+    document.addEventListener("click", armPostFromClick, true);
+
+    selModeBtn.onclick = () => { selectMode = !selectMode; updateSelectBar(); };
+    selAutoBtn.onclick = () => {
+      autoQueueMode = !autoQueueMode;
+      saveStore("autoQueue", autoQueueMode);
+      if (autoQueueMode) { seenAutoQueueKeys.clear(); log.info("auto-queue on"); }
+      updateSelectBar();
     };
-    const observer = new MutationObserver((records) => {
-      if (records.some((r) => {
-        const target = r.target instanceof Element ? r.target : r.target.parentElement;
-        if (target?.closest("#sakerly-panel, #sakerly-select-bar, .sakerly-dl, ._sakerly_pinned_dl, .sakerly-queue")) return false;
-        return target?.closest(roots) || Array.from(r.addedNodes).some((n) =>
-          n instanceof Element && (n.matches(roots) || n.querySelector(roots))
-        );
-      })) schedule();
+    selClearBtn.onclick = clearSelection;
+    selAllBtn.onclick = () => {
+      const seen = new Set();
+      for (const items of selectedItems.values()) for (const it of items) seen.add(it.key);
+      const scopes = pickPhotoScopes(document);
+      let added = 0;
+      for (const sc of scopes) {
+        const item = scopeToPhotoItem(sc);
+        if (!item || seen.has(item.key)) continue;
+        // kiểm tra đúng ảnh sẽ được tải (item.el), không phải ảnh đầu tiên trong scope
+        if (!isElementVisibleInViewport(item.el)) continue;
+        seen.add(item.key);
+        const bubble = sc.closest(".bubble, .Message");
+        if (!bubble) continue;
+        const list = selectedItems.get(bubble) || [];
+        list.push(item);
+        selectedItems.set(bubble, list);
+        selectedBubbles.add(bubble);
+        bubble.classList.add("sk-sel");
+        paintTick(item);
+        added++;
+      }
+      log.info(`select-visible: +${added} (total ${totalSelectedItems()})`);
+      updateSelectBar();
+    };
+    selDlBtn.onclick = () => {
+      const items = [...selectedItems.values()].flat();
+      if (!items.length) return;
+      let queued = 0, skipped = 0;
+      for (const it of items) {
+        if (downloadedKeys.has(it.key)) { skipped++; continue; }
+        downloadMedia(it.url, it.kind, { batch: true, silent: true, mediaKey: it.key });
+        queued++;
+      }
+      log.info(`batch: queued ${queued}, skipped ${skipped} already downloaded`);
+      clearSelection();
+      if (skipped) flashDlButton(t("skippedDownloaded", { n: skipped }));
+    };
+
+    // phím tắt
+    window.addEventListener("keydown", (e) => {
+      if (!e.ctrlKey || !e.shiftKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "m") { e.preventDefault(); selectMode = !selectMode; updateSelectBar(); }
+      else if (k === "a") { e.preventDefault(); selAutoBtn.click(); }
+      else if (k === "d") { e.preventDefault(); selDlBtn.onclick(); }
     });
-    observer.observe(document.body, {
-      childList: true, subtree: true, attributes: true,
-      attributeFilter: ["class", "src", "data-mid", "data-peer-id", "disabled", "aria-disabled", "hidden"],
+
+    if (refreshApp) {
+      const roots = isWebK
+        ? ".media-viewer-whole, #stories-viewer, .pinned-audio, audio-element"
+        : "#MediaViewer, #StoryViewer";
+      let pending;
+      const schedule = () => {
+        if (pending) return;
+        pending = setTimeout(() => { pending = null; refreshApp(); }, 100);
+      };
+      const observer = new MutationObserver((records) => {
+        if (records.some((r) => {
+          const target = r.target instanceof Element ? r.target : r.target.parentElement;
+          if (target?.closest("#sk-panel, #sk-select, #sk-settings, .sk-dl-btn, .sk-pinned-dl, .sk-queue-btn")) return false;
+          if (target?.closest(roots) || Array.from(r.addedNodes).some((n) =>
+            n instanceof Element && (n.matches(roots) || n.querySelector(roots))
+          )) return true;
+          // viewer bị gỡ khỏi DOM (đóng dialog WebA) → cần chạy refresh để kéo
+          // panel trở lại body (panel đang nằm bên trong dialog)
+          return Array.from(r.removedNodes).some((n) =>
+            n instanceof Element && (n.matches?.(roots) || n.querySelector?.(roots))
+          );
+        })) schedule();
+      });
+      observer.observe(document.body, {
+        childList: true, subtree: true, attributes: true,
+        attributeFilter: ["class", "src", "data-mid", "data-peer-id", "disabled", "aria-disabled", "hidden"],
+      });
+      setInterval(() => { if (!document.hidden) refreshApp(); }, REFRESH_DELAY);
+      document.addEventListener("visibilitychange", schedule);
+      refreshApp();
+    }
+
+    log.info(`SakerLy Telegram Media Downloader v${SCRIPT_VERSION} loaded — parallel engine ×${getConnections()} (${currentLang.toUpperCase()}, ${isWebK ? "WebK" : isWebA ? "WebA" : "?"})`);
+  };
+
+  // ===========================================================================
+  // SECTION 22: test hooks + entry point
+  // ===========================================================================
+  if (TEST_MODE) {
+    Object.assign(globalThis.__SK_TEST__, {
+      RangeLedger, SpeedMeter, NetBudget, MemWriter, FsWriter, BlobRegistry,
+      backoffDelay, formatBytes, formatDuration, t, LANGS,
+      getConnections, setSettings: (s) => Object.assign(settings, s),
+      // engine test hooks
+      __internal: {
+        CHUNK_GRID, CHUNK_DEFAULT, CHUNK_MAX, CHUNK_MIN, CHUNK_RETRIES,
+        buildEngine: () => ({ engineDownload, fetchChunk, parallelRangeDownload, downloadFromBlob, concatU8 }),
+        makeTask: (url, kind = "video") => ({
+          id: "test-" + Math.random().toString(36).slice(2),
+          key: "test:" + url, url, kind, mediaKey: "test",
+          fileName: "test.bin", state: "preparing", received: 0, total: null,
+          speed: 0, eta: null, inflight: 0,
+          controller: new AbortController(), meter: new SpeedMeter(),
+          startedAt: performance.now(), finished: false,
+          pauseFlag: false, cancelRequested: false,
+          writer: new MemWriter(), onProgress: () => {},
+        }),
+      },
     });
-    setInterval(() => { if (!document.hidden) refreshApp(); }, REFRESH_DELAY);
-    document.addEventListener("visibilitychange", schedule);
-    refreshApp();
+    return; // không chạy boot trong test / skip boot in test mode
   }
 
-  log.info(`SakerLy Telegram Media Downloader v${SCRIPT_VERSION} loaded (${currentLang.toUpperCase()})`);
+  boot();
 })();
