@@ -311,6 +311,11 @@
       const peer = midEl.closest("[data-peer-id]")?.dataset.peerId || "";
       return `msg:${peer}:${midEl.dataset.mid}`;
     }
+    // webA (telegram-tt): album media carry id="album-media-message-<id>[-<index>]" (Album.tsx),
+    // the message root carries data-message-id (Message.tsx); the chat id lives in the URL hash
+    const albumId = el?.closest?.("[id^='album-media-']")?.id;
+    const msgId = el?.closest?.("[data-message-id]")?.dataset.messageId;
+    if (albumId || msgId) return `msg:${location.hash.slice(1)}:${albumId || msgId}`;
     return `url:${url}`;
   };
 
@@ -833,10 +838,6 @@
   // ===== bubble resolution for batch select =================================
   // album items in tweb carry their own data-mid (prepareAlbum.ts), so [data-mid] must not count as a bubble
   const BUBBLE_SELECTORS = [".bubble", ".Message"].join(",");
-  const ALBUM_ITEM_SELECTOR = [
-    ".grouped-item", ".album-item", "[class*='Album'] [class*='media']",
-    ".media-container", ".Message__media-item",
-  ].join(",");
   const VIDEO_HINT_SELECTOR = [
     "[class*='play']", "[class*='Play']",
     "[class*='duration']", "[class*='Duration']",
@@ -854,10 +855,12 @@
   // Everything OUTSIDE .attachment — reply quotes (.reply/.reply-content), link previews (.webpage/.webpage-preview),
   // avatars (.bubbles-group-avatar/.user-avatar/.bubble-name-forwarded-avatar), stickers (.bubble.sticker),
   // video-round (.bubble.round), emoji-big, service bubbles — never selects.
-  // webz fallback: `.Message__media-item`.
   // `.bubble__media-container` replaces `.attachment` on bubbles with a media tail (bubbles.ts viewer targets)
-  const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message__media-item";
-  const EXCLUDED_SCOPES = ".reply, .reply-content, .reply-summary, .reply-wrapper, .reply-media, .webpage, .webpage-preview, .webpage-with-thumb, .webpage-thumb, .bubbles-group-avatar, .bubbles-group-avatar-container, .user-avatar, .bubble-name-forwarded-avatar, avatar-element, .avatar, .service-msg, .bubble-service-media, .sticker-wrapper, [class*='Sticker'], .custom-emoji, [class*='CustomEmoji'], .emoji, .reactions, .reactions-like-block, .reaction, [class*='Reaction'], .peer-title, .bubble-name-chip-container, [class*='Avatar']";
+  // webA (telegram-tt): message root `.Message`, every photo/video renders as `.media-inner`
+  // (Photo.tsx / Video.tsx), album pieces as `.album-item` (Album.tsx); reply previews are
+  // `.EmbeddedMessage`, link previews `.WebPage` (class names are case-sensitive).
+  const ATTACHMENT_CONTAINER = ".bubble .attachment, .bubble .bubble__media-container, .Message .media-inner";
+  const EXCLUDED_SCOPES = ".EmbeddedMessage, .WebPage, .reply,.reply-content, .reply-summary, .reply-wrapper, .reply-media, .webpage, .webpage-preview, .webpage-with-thumb, .webpage-thumb, .bubbles-group-avatar, .bubbles-group-avatar-container, .user-avatar, .bubble-name-forwarded-avatar, avatar-element, .avatar, .service-msg, .bubble-service-media, .sticker-wrapper, [class*='Sticker'], .custom-emoji, [class*='CustomEmoji'], .emoji, .reactions, .reactions-like-block, .reaction, [class*='Reaction'], .peer-title, .bubble-name-chip-container, [class*='Avatar']";
   const EXCLUDED_BUBBLE_CLASSES = ".bubble.service, .bubble.has-fake-service, .bubble.sticker, .bubble.round, .bubble.emoji-big, .bubble.is-invoice";
   const isRealAttachment = (el) => {
     if (!el) return false;
@@ -893,11 +896,13 @@
   //     and any video-time badge rule out the scope)
   //   - the scope has no .video-time / .ckin__player / play-icon marker (unopened video thumbnail)
   //   - the scope is NOT inside .reply, .webpage, avatar, sticker, reaction, etc.
-  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .bubble .bubble__media-container, .Message__media-item";
-  const PHOTO_IMG_SELECTOR = "img.media-photo";
+  const PHOTO_SCOPE_SELECTOR = ".bubble .album-item, .bubble .attachment, .bubble .bubble__media-container, .Message .album-item, .Message .media-inner";
+  // webA: the real photo is img.full-media; a video's poster is img.thumbnail and its stream is video.full-media
+  const PHOTO_IMG_SELECTOR = "img.media-photo, img.full-media";
   // tweb wrappers/video.ts: posters are drawn by wrapPhoto and get `media-photo` too, so the img class alone
   // can't tell photo from video. these markers are only ever added for video/gif/round media.
-  const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player";
+  // webA: video wrappers are `.media-inner.dark` with a `.message-media-duration` badge (Video.tsx)
+  const VIDEO_MARKERS = "video, .media-video, .video-time, .video-play, .media-round, .media-gif-wrapper, .media-sticker-wrapper, .ckin__player, .media-inner.dark, .message-media-duration, .RoundVideo";
   const scopeIsVideoLike = (scope) =>
     scope.matches(VIDEO_MARKERS) || !!scope.querySelector(VIDEO_MARKERS);
   const pickPhotoScopes = (root) =>
@@ -908,8 +913,24 @@
       if (scopeIsVideoLike(s)) return false;
       // if we're on an .attachment that itself holds .album-item children, defer to those (richer scopes)
       if (s.matches(".attachment") && s.querySelector(".album-item")) return false;
+      // webA: a photo's `.media-inner` sits inside its `.album-item` — count the album-item only
+      if (s.matches(".media-inner") && s.closest(".album-item")) return false;
       return !!s.querySelector(PHOTO_IMG_SELECTOR);
     });
+  // diagnostic for the console: why each media scope in a post was rejected
+  const explainNoPhoto = (bubble) => {
+    const scopes = Array.from(bubble.querySelectorAll(PHOTO_SCOPE_SELECTOR));
+    if (!scopes.length) return `no media container (post classes: ${bubble.className})`;
+    return scopes.map((s, i) => {
+      const excl = s.closest(EXCLUDED_SCOPES);
+      if (excl) return `#${i} inside excluded .${excl.className}`;
+      if (scopeIsVideoLike(s)) return `#${i} video`;
+      const img = s.querySelector(PHOTO_IMG_SELECTOR);
+      if (!img) return `#${i} no loaded photo img`;
+      if (img.naturalWidth <= 100) return `#${i} photo still loading (${img.naturalWidth}px)`;
+      return `#${i} ok`;
+    }).join(", ");
+  };
   const scopeToPhotoItem = (scope) => {
     const img = Array.from(scope.querySelectorAll(PHOTO_IMG_SELECTOR))
       // stripped blur placeholders also carry media-photo (photo.ts) but are ~40px; anything above 100px is the real image
@@ -972,7 +993,7 @@
   // paint a per-photo tick overlay anchored to the photo's own container (album-item-media or the img itself).
   // overlay element lives in the item's own node so a 4-photo album shows 4 ticks, not 1 on the bubble.
   const paintTick = (item) => {
-    const anchor = item.el?.closest(".album-item-media, .album-item, .attachment, .Message__media-item") || item.el?.parentElement;
+    const anchor = item.el?.closest(".album-item-media, .album-item, .attachment, .media-inner") || item.el?.parentElement;
     if (!anchor) return;
     if (getComputedStyle(anchor).position === "static") anchor.style.position = "relative";
     anchor.classList.add("sakerly-sel-item");
@@ -1010,9 +1031,7 @@
       if (it && !seen.has(it.key)) { seen.add(it.key); items.push(it); }
     }
     if (!items.length) {
-      // either a video post, or still-skeleton bubble — tell the user why nothing happened
-      const hasVideo = !!bubble.querySelector(".bubble .attachment video, .bubble .video-time");
-      log.info(hasVideo ? "video post — use Auto-queue in viewer" : "no post photo resolved yet (bubble not fully loaded)");
+      log.info(`nothing selectable in this post: ${explainNoPhoto(bubble)}`);
       return;
     }
     bubble.classList.add("sakerly-sel");
