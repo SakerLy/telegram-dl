@@ -5,7 +5,7 @@
 Tải ảnh, video, GIF và voice từ **Telegram Web**, kể cả kênh chặn lưu nội dung.<br>
 Download photos, videos, GIFs and voice messages from **Telegram Web**, including channels that restrict saving.
 
-[![Version](https://img.shields.io/badge/version-2.2.0-1a72bd)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.1-1a72bd)](CHANGELOG.md)
 [![WebK](https://img.shields.io/badge/Telegram-WebK-2aabee)](https://web.telegram.org/k/)
 [![WebA](https://img.shields.io/badge/Telegram-WebA-2aabee)](https://web.telegram.org/a/)
 [![Userscript](https://img.shields.io/badge/userscript-Tampermonkey%20%7C%20Violentmonkey-00485b)](#cài-đặt)
