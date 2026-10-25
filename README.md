@@ -13,6 +13,14 @@ A userscript to download photos, videos, GIFs and voice messages from **Telegram
 
 **Engine v2.0 — viết lại theo kiến trúc tải file của 2 client Web chính thức của Telegram** ([WebK](https://github.com/morethanwords/tweb) + [WebA](https://github.com/Ajaxy/telegram-tt)):
 
+**v2.2 — đối chiếu lại DOM tweb/telegram-tt mới nhất + sửa 6 lỗi và 2 lỗi engine ẩn** (xem [Changelog](CHANGELOG.md)):
+
+- **Chọn tất cả hiển thị** giờ chỉ chọn ảnh thật sự nhìn thấy trong khung chat (≥50% diện tích, không tính ảnh sau composer) — không còn tải nhầm sticker, ảnh bản đồ, quảng cáo hay thumb reply (WebA)
+- **Auto-queue tự chuyển slide đáng tin cậy trên cả WebK & WebA** — đọc đúng slide hiện tại của viewer mới (mover wrapper), không còn chết khi video load chậm hơn 5s, WebA chuyển slide bằng đúng cơ chế ArrowRight của client gốc
+- **Pause → Resume hoạt động thật sự** với mọi loại task (sửa 2 lỗi engine: thiếu `MemWriter.open()` và claim ma sau pause khiến resume treo vĩnh viễn)
+- **Panel không tự bung ra nữa** khi có task mới sau khi bạn thu gọn; chiều cao card/panel ổn định, danh sách tự cuộn bên trong
+- **Nút bấm dễ đọc ở cả 2 theme** — chữ trắng trên nền đậm, mọi cặp màu ≥ 4.5:1 WCAG; nút xoá danh sách có icon thùng rác
+
 - **Tải song song** nhiều chunk đồng thời mỗi file (mặc định 3 luồng như Telegram WebA, chỉnh 1–4 trong Settings)
 - **Tự động retry** chunk lỗi 5 lần với backoff lũy tiến (250ms → 8s + jitter), tự thu nhỏ chunk khi timeout
 - **Resume trong phiên**: lỗi giữa chừng bấm *Retry* tải tiếp từ chỗ dừng, không tải lại từ đầu; có **Pause/Resume**
@@ -51,8 +59,8 @@ Hỗ trợ `web.telegram.org/k/` (WebK) và `web.telegram.org/a/` (WebA). Auto-q
 
 **Tải video.** Video chỉ có nguồn tải khi được mở trong trình xem, vì vậy dùng **Auto-queue**:
 1. Bật **Auto-queue video**.
-2. Click vào media đầu tiên của post. Script đếm số video trong post ngay lúc này.
-3. Script tự tải từng video, bỏ qua ảnh, tự chuyển slide và dừng khi đủ video của post.
+2. Click vào media muốn bắt đầu. Script đếm ngay số video phía trước trong khung chat (cả post đó lẫn các post/reply bên dưới đã tải trong chat).
+3. Script tự tải từng video, bỏ qua ảnh, tự chuyển slide và dừng ngay sau video cuối cùng, không đi tiếp qua các slide chỉ còn ảnh.
 
 **Pause / Resume / Retry.** Mỗi task trong panel *Tải xuống* có nút Tạm dừng — Tiếp tục — Thử lại. Thử lại sau khi lỗi chỉ tải phần chưa xong, không tải lại từ đầu.
 
@@ -102,6 +110,14 @@ Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampe
 
 **v2.0 engine — rewritten after the file-download architecture of the two official Telegram Web clients** ([WebK](https://github.com/morethanwords/tweb) + [WebA](https://github.com/Ajaxy/telegram-tt)):
 
+**v2.2 — selectors re-verified against the current tweb/telegram-tt source + 6 reported bugs and 2 hidden engine bugs fixed** (see [Changelog](CHANGELOG.md)):
+
+- **Select all visible** now picks only photos genuinely visible in the chat viewport (≥50% of their area, nothing hidden behind the composer) — no more accidentally downloading stickers, map tiles, sponsored messages or reply thumbnails (WebA)
+- **Auto-queue reliably advances slides on both WebK & WebA** — reads the viewer's real current slide (mover wrappers), no longer stalls when a video takes over 5s to load, and drives WebA via its native ArrowRight mechanism
+- **Pause → Resume actually works** for every task type (fixed 2 engine bugs: missing `MemWriter.open()` and a leaked ledger claim after pause that froze resume forever)
+- **The panel no longer pops open** when new tasks arrive after you collapsed it; card/panel heights are stable and lists scroll inside the panel
+- **Buttons are readable in both themes** — white text on solid fills, every color pair ≥ 4.5:1 WCAG; the clear-history button now has a trash icon
+
 - **True parallel download**: N concurrent chunks per file (default 3, matching Telegram WebA; configurable 1–4 in Settings)
 - **Automatic retry**: up to 5 attempts per chunk with exponential backoff (250ms → 8s + jitter), auto-shrinking chunk size on repeated timeouts
 - **In-session resume**: after a failure, *Retry* continues from where it stopped instead of restarting; **Pause/Resume** supported
@@ -140,8 +156,8 @@ Supports `web.telegram.org/k/` (WebK) and `web.telegram.org/a/` (WebA). Auto-que
 
 **Videos.** A video only has a downloadable source once it's open in the viewer, so use **Auto-queue**:
 1. Enable **Auto-queue video**.
-2. Click the first media of a post. The script counts the post's videos at that moment.
-3. It downloads each video, skips photos, advances slides by itself and stops once the post's videos are done.
+2. Click the media you want to start from. The script immediately counts the videos ahead in the chat (that post plus the posts/replies loaded below it).
+3. It downloads each video, skips photos, advances slides by itself and stops right after the last video instead of walking through photo-only slides.
 
 **Pause / Resume / Retry.** Every task in the *Downloads* panel has Pause — Resume — Retry controls. Retrying after a failure only fetches the missing part, never from scratch.
 

@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.2.0 — Sửa 6 lỗi báo cáo + 2 lỗi engine tìm thấy khi test kỹ, đối chiếu DOM tweb/telegram-tt mới nhất
+
+Toàn bộ selector và luồng viewer được đối chiếu lại với source hiện tại của **tweb** (WebK) và **telegram-tt** (WebA) trước khi sửa — nhiều giả định của v2.1 đã lỗi thời.
+
+### 1. "Chọn tất cả hiển thị" tải nhầm mục (ảnh bị che / sticker / ảnh bản đồ / quảng cáo)
+- **Visibility chặt lại**: cũ chỉ cần 40×40px giao với *cửa sổ trình duyệt* — ảnh nằm sau composer, sau topbar hay mới ló vài chục px ở mép vẫn bị chọn rồi tải. Giờ "hiển thị" = **≥50% diện tích ảnh nằm trong vùng nhìn thấy thật của khung chat** (`.bubbles-viewport` của WebK / `.MessageList` của WebA), ảnh phải có kích thước thật.
+- **WebA — sticker bị tải như ảnh** (telegram-tt StickerView.tsx): sticker tĩnh render `<img class="full-media sticker-media">` trong `.media-inner` → giờ bị loại qua `.sticker-media`.
+- **WebA — ảnh bản đồ bị tải** (Location.tsx): `.Location.media-inner` chứa `img.full-media.map` → loại qua `.Location`, `.map`, `.venue-icon`.
+- **WebA — tin quảng cáo** có `.SponsoredMessage.Message` (vẫn là `.Message`!) → loại qua `.SponsoredMessage`, `.sponsored-media-preview`; WebK qua `.bubble.sponsored`.
+- Loại thêm lưới sticker của trang web (`.WebPage--sticker`, `.webpage-stickerset-grid`). Thumb reply/quote vốn đã an toàn ở cả 2 client (`.reply-media` không khớp scope; `.EmbeddedMessage` đã exclude).
+
+### 2. Nút "Xoá danh sách tải" không có icon
+- Nút `.sk-clear` vốn **rỗng** (không có icon nào). Giờ có icon thùng rác SVG đồng bộ style với bánh răng.
+
+### 3 + 6. Màu chữ nút chìm, khó đọc (đặc biệt theme tối)
+- Theme tối cũ dùng **chữ đen trên nền xanh sáng** (`--sk-accent-fg:#06111c` trên `#4aa5ff`, `--sk-ok-fg:#052012` trên `#10b981`) — về mặt kỹ thuật đủ tương phản nhưng nhìn "tối và chìm". Giờ **chữ trắng trên nền đậm**: `#1a72bd`/`#0b7c56`, mọi cặp chữ-nền ≥ 4.5:1 WCAG ở cả 2 theme (kiểm chứng bằng script đo tương phản).
+- Đổi mới toàn bộ: chip đếm (`#9fd1ff` trên `#1c3a5c`), nút danger (`#d92d20` light / `#ff6b6b` dark), focus ring, thanh progress tách màu nền nút (`--sk-accent-bar`) khỏi màu nút để nền nút đậm mà thanh vẫn sáng.
+- Thanh `✓` chọn ảnh: nền xanh đậm + dấu trắng.
+
+### 4. Auto-queue không tự chuyển video (WebK)
+Ba nguyên nhân chồng nhau, đều đã xử lý:
+- **Resolver đọc nhầm slide cũ**: tweb giờ bọc mỗi slide trong `.media-viewer-mover-wrapper` riêng và **append wrapper mới sau wrapper cũ** khi chuyển slide — `querySelector` lấy aspecter *đầu tiên* sẽ đọc đúng slide đang bay ra khỏi màn hình. Giờ đọc mover **`center active`** (trạng thái nghỉ), fallback wrapper cuối cùng.
+- **`armedPost` hết hạn 5 giây**: video lớn load chậm hơn 5s → post bị bỏ, sau đó `if (!post) return` khiến viewer **đứng im sau khi xếp hàng video đầu tiên**. Giờ auto-advance **không phụ thuộc armedPost**: luôn tự chuyển khi Auto-queue bật, dừng khi hết slide hoặc 10 slide liên tiếp không có video mới; armedPost chỉ còn phục vụ thông báo "Xong post: N video".
+- **WebA bấm nút chết**: `button.navigation.next` trong telegram-tt **không có click handler** (chỉ là nút trang trí; đổi slide thật qua `keydown` ArrowRight trên document). v2.1 click nút này rồi return → không bao giờ chuyển. Giờ dispatch ArrowRight trực tiếp, dừng sớm khi nút bị `hide` (hết slide).
+
+### 5. Panel lịch sử bị đẩy / kéo dài ra khi bấm sau khi tải xong
+- **Không còn tự bung panel**: v2.1 mỗi task card mới đều `remove("collapsed")` — user thu gọn rồi nó cứ bung ra liên tục (đặc biệt với auto-queue). Giờ ghi nhớ ý muốn thu gọn của user; task mới chỉ xuất hiện card, panel giữ nguyên.
+- **Chiều cao card ổn định**: hàng nút (Tạm dừng / Hủy / Thử lại) giữ slot cố định — ẩn/hiện nút theo state không còn làm card giật giật kéo panel theo.
+- **Flexbox chuẩn**: `.sk-task-list` / `.sk-select-body` có `flex:1 1 auto; min-height:0` — danh sách tự cuộn bên trong panel `max-height` thay vì đẩy panel dài ra; panel Downloads giới hạn `min(100vh-32px, 620px)`.
+- **Cuộn đúng chỗ**: `scrollIntoView` (cuộn được cả trang) thay bằng cuộn riêng trong `.sk-task-list`.
+
+### Hai lỗi engine tìm thấy khi test (có trong cả v2.0–v2.1)
+- **Pause → Resume luôn fail với task ghi qua bộ nhớ** (Firefox / không có File System Access): `MemWriter` thiếu method `open()` → `this.inner.open is not a function`. Đã thêm no-op.
+- **Claim ma sau pause = resume treo vĩnh viễn**: khi pause hủy request giữa chừng, đường thoát "bình thường" (cancel → đọc hết → complete → nhận partial claim) ném lỗi ở đầu vòng lặp mà **không trả claim về ledger** → hole bị đánh dấu "đang giữ" mãi → Resume chỉ xoay vòng poll, không fetch tiếp (đến 120s watchdog mới giết task). Giờ mọi lối thoát lỗi của worker đều `ledger.release(claim)` tập trung ở `catch` ngoài. Kiểm chứng: resume fetch đúng range thiếu, không tải lại từ đầu.
+
+### Kiểm thử
+- 18 bài test engine headless (Node): RangeLedger, song song, response bị kẹp ngắn, mime sai fatal, HTTP 500 retry, pause, cancel, blob fast-path, retry hết lượt, NetBudget, i18n — 18/18 pass.
+- 5 lần chạy bài tái hiện pause→resume: không claim ma, hoàn tất đúng phần thiếu.
+- Script đo tương phản WCAG: 26/26 cặp màu ≥ 4.5:1 (2 theme).
+- UI test trên Chromium thật với 2 trang mock DOM dựng theo đúng source tweb/telegram-tt (album, sticker, Location, reply, sponsored, viewer đa mover, dialog top-layer): chọn tất cả đúng tập ảnh hiển thị; loại sticker/map/reply-thumb/quảng cáo; auto-queue WebK chuyển đủ slide & dừng đúng; auto-queue WebA chạy bằng ArrowRight (không đụng nút chết); panel giữ trạng thái thu gọn; đổi ngôn ngữ VI/EN; phím tắt; panel vẫn click được trong dialog WebA.
+
 ## 2.1.0 — Panel trên viewer WebA (top-layer), UI mới, auto-queue thông minh, chống trùng lặp
 
 ### Panel "biến mất" trên view video (WebA) — sửa tận gốc
