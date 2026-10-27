@@ -9,6 +9,7 @@ Download photos, videos, GIFs and voice messages from **Telegram Web**, includin
 [![WebK](https://img.shields.io/badge/Telegram-WebK-2aabee)](https://web.telegram.org/k/)
 [![WebA](https://img.shields.io/badge/Telegram-WebA-2aabee)](https://web.telegram.org/a/)
 [![Userscript](https://img.shields.io/badge/userscript-Tampermonkey%20%7C%20Violentmonkey-00485b)](#cài-đặt)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 **[Tiếng Việt](#tiếng-việt)** · **[English](#english)** · **[Changelog](CHANGELOG.md)**
 
@@ -195,5 +196,7 @@ The script checks for updates every 24 hours. To check now: Tampermonkey → Das
 <div align="center">
 
 Built by **SakerLy** · download engine modelled on [tweb](https://github.com/morethanwords/tweb) and [telegram-tt](https://github.com/Ajaxy/telegram-tt)
+
+Phát hành theo giấy phép / Licensed under [GPL-3.0-or-later](LICENSE)
 
 </div>

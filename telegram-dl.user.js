@@ -7,6 +7,7 @@
 // @description  Tải ảnh, GIF, video, voice từ Telegram Web (WebK + WebA) — engine song song kiểu client chính thức: nhiều chunk đồng thời, retry backoff, resume trong phiên, tốc độ thực + ETA.
 // @description:en  Download images, GIFs, videos and voice from Telegram Web (WebK + WebA) — official-client-style parallel engine: concurrent chunks, retry with backoff, in-session resume, real speed + ETA.
 // @author       SakerLy
+// @license      GPL-3.0-or-later
 // @match        https://web.telegram.org/*
 // @match        https://webk.telegram.org/*
 // @match        https://webz.telegram.org/*
