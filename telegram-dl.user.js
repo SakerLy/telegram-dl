@@ -1504,6 +1504,9 @@
       .sk-btn:disabled { opacity: .6; cursor: not-allowed; }
       .sk-btn .sk-btn-ic { display: inline-flex; flex-shrink: 0; }
       .sk-btn .sk-btn-ic svg { width: 14px; height: 14px; }
+      /* nút gắn vào viewer: icon là SVG riêng, không phụ thuộc icon font của Telegram */
+      .sk-queue-icon, .sk-wa-icon { display: inline-flex; align-items: center; justify-content: center; color: #fff; pointer-events: none; }
+      .sk-queue-icon svg, .sk-wa-icon svg { width: 22px; height: 22px; display: block; }
 
       .sk-btn.sk-primary {
         background: var(--sk-accent); border-color: var(--sk-accent); color: var(--sk-accent-fg);
@@ -2835,7 +2838,7 @@
       if (header && !header.querySelector(".sk-dl-btn") && !getWebADlButtons(header).length) {
         const b = document.createElement("button");
         b.className = "Button TkphaPyQ tiny translucent-white round sk-dl-btn";
-        b.innerHTML = '<i class="icon icon-download" aria-hidden="true"></i>';
+        b.innerHTML = `<span class="sk-wa-icon" aria-hidden="true">${DL_ICON_SVG}</span>`;
         b.type = "button";
         b.title = t("download"); b.setAttribute("aria-label", t("download"));
         b.onclick = () => {
@@ -2849,37 +2852,36 @@
         header.prepend(b);
       }
     }
-    const media = document.querySelector("#MediaViewer .MediaViewerSlide--active");
-    const actions = document.querySelector("#MediaViewer .MediaViewerActions");
-    if (!media || !actions) return;
-    const v = media.querySelector(".VideoPlayer video");
-    const i = media.querySelector(".MediaViewerContent > div > img");
-    if (!getMediaSource(v) && !getMediaSource(i)) return;
+    const dlg = document.getElementById("MediaViewer");
+    const media = dlg?.querySelector(".MediaViewerSlide--active");
+    if (!media) return;
     const makeBtn = () => {
       const b = document.createElement("button");
       b.className = "Button smaller translucent-white round sk-dl-btn";
-      b.innerHTML = '<i class="icon icon-download" aria-hidden="true"></i>';
+      b.innerHTML = `<span class="sk-wa-icon" aria-hidden="true">${DL_ICON_SVG}</span>`;
       b.type = "button";
       b.title = t("download"); b.setAttribute("aria-label", t("download"));
       b.onclick = downloadCurrentWebAMedia;
       return b;
     };
-    if (getWebADlButtons(actions).length) {
-      actions.querySelectorAll("button.sk-dl-btn").forEach((b) => b.remove());
-    } else if (!actions.querySelector("button.sk-dl-btn")) {
-      actions.prepend(makeBtn());
-    }
-    if (resolveViewerWebAMedia() && !actions.querySelector("button.sk-queue-btn")) {
-      actions.prepend(makeWebAQueueButton());
+    // thanh trên và player xử lý riêng: thiếu cái này không được chặn cái kia.
+    // Nút được gắn ngay khi viewer mở, không chờ video có src: lúc bấm mới đọc nguồn.
+    // layout mobile của telegram-tt render .MediaViewerActions-mobile thay cho .MediaViewerActions
+    const actions = dlg.querySelector(".MediaViewerActions, .MediaViewerActions-mobile");
+    if (actions) {
+      if (getWebADlButtons(actions).length) {
+        actions.querySelectorAll("button.sk-dl-btn").forEach((b) => b.remove());
+      } else if (!actions.querySelector("button.sk-dl-btn")) {
+        actions.prepend(makeBtn());
+      }
+      if (!actions.querySelector("button.sk-queue-btn")) actions.prepend(makeWebAQueueButton());
     }
     const controls = media.querySelector(".VideoPlayerControls .buttons");
-    if (v && controls && !controls.querySelector("button.sk-dl-btn")) {
+    if (controls) {
       const sp = controls.querySelector(".spacer");
-      if (sp) sp.after(makeBtn()); else controls.appendChild(makeBtn());
-    }
-    if (v && controls && !controls.querySelector("button.sk-queue-btn")) {
-      const sp = controls.querySelector(".spacer");
-      if (sp) sp.after(makeWebAQueueButton()); else controls.appendChild(makeWebAQueueButton());
+      const place = (b) => (sp ? sp.after(b) : controls.appendChild(b));
+      if (!controls.querySelector("button.sk-dl-btn")) place(makeBtn());
+      if (!controls.querySelector("button.sk-queue-btn")) place(makeWebAQueueButton());
     }
   };
 
