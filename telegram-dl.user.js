@@ -2,7 +2,7 @@
 // @name         Telegram Media Downloader
 // @name:en      Telegram Media Downloader
 // @name:vi      Trình tải media Telegram
-// @version      2.2.1
+// @version      2.2.2
 // @namespace    sakerly
 // @description  Tải ảnh, GIF, video, voice từ Telegram Web (WebK + WebA) — engine song song kiểu client chính thức: nhiều chunk đồng thời, retry backoff, resume trong phiên, tốc độ thực + ETA.
 // @description:en  Download images, GIFs, videos and voice from Telegram Web (WebK + WebA) — official-client-style parallel engine: concurrent chunks, retry with backoff, in-session resume, real speed + ETA.
@@ -20,21 +20,19 @@
 // @downloadURL  https://raw.githubusercontent.com/SakerLy/telegram-dl/main/telegram-dl.user.js
 // ==/UserScript==
 
-/* global globalThis, FileSystemFileHandle */
+/* global FileSystemFileHandle */
 
 (function () {
   "use strict";
 
-  const TEST_MODE = typeof globalThis.__SK_TEST__ === "object"; // bật bởi bộ test Node: lộ nội bộ, bỏ qua dựng UI
 
   const SCRIPT_VERSION =
-    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.2.1";
+    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.2.2";
 
   const KB = 1024;
   const MB = 1024 * 1024;
 
   // 512KB: grid chunk của SW WebK và mức kẹp mỗi response 206 của SW WebA
-  const CHUNK_GRID = 512 * KB;
   const CHUNK_DEFAULT = 512 * KB;
   const CHUNK_MAX = 1024 * KB; // = MAX_DOWNLOAD_FILE_PART_SIZE (tweb & gramjs)
   const CHUNK_MIN = 256 * KB;
@@ -47,9 +45,7 @@
   // SW WebA cho mỗi part chờ tới 60s
   const STALL_TIMEOUT_MS = 60 * 1000;
 
-  // dcBandwidthManager của WebA cho 9MB; nới lên vì chạy 2 task cùng lúc
-  const NET_BUDGET_BYTES = 12 * MB;
-
+  // tối đa 2 task × 4 luồng × 1MB = 8MB đang tải cùng lúc, dưới mức 9MB dcBandwidthManager của WebA
   const MAX_ACTIVE_TASKS = 2;
 
   const WATCHDOG_MS = 120 * 1000; // ledger đứng yên quá lâu thì fail task, tránh treo vĩnh viễn
@@ -61,6 +57,8 @@
   const BLOB_REGISTRY_BYTES = 384 * MB;
 
   const DOWNLOADED_CAP = 5000;
+  const FILE_LIST_SCAN_MAX = 5000; // shortcut: thư mục lưu lớn hơn chỉ quét 5000 file đầu, có thể sót file mới; nâng khi người dùng báo
+  const FILE_LIST_SHOW_MAX = 200;
   const REFRESH_DELAY = 2000;
 
   const LANGS = {
@@ -73,7 +71,6 @@
       preparing: "Đang chuẩn bị", queued: "Đang chờ", downloading: "Đang tải",
       paused: "Đã tạm dừng", saving: "Đang lưu", completed: "Hoàn tất",
       handedOff: "Trình duyệt tự tải", failed: "Thất bại", cancelled: "Đã hủy",
-      resumedTask: "Tiếp tục từ {percent}%",
       eta: "còn {time}", rate: "{speed}/s",
       video: "video", audio: "âm thanh", image: "ảnh", unknownType: "không rõ định dạng",
       errorHttp: "Yêu cầu thất bại (HTTP {status})",
@@ -86,6 +83,9 @@
       errorIncomplete: "Dữ liệu không đầy đủ",
       errorStall: "Không nhận được dữ liệu trong 60 giây",
       errorNoData: "Nguồn không trả về dữ liệu",
+      errorBlobGone: "Telegram đã giải phóng media này; mở lại media rồi tải lại",
+      skipped: "Đã tải trước đó, bỏ qua",
+      hlsNotFound: "Không tìm được nguồn HLS của video này; mở lại video rồi thử lại",
       errorFatal: "Tải thất bại: {message}",
       selectTitle: "Chọn hàng loạt",
       selectMode: "Chế độ chọn", selectAll: "Chọn tất cả hiển thị",
@@ -98,16 +98,24 @@
       topbarQueue: "Thêm vào hàng chờ",
       settings: "Cài đặt", settingsTitle: "Cài đặt tải xuống",
       connections: "Số luồng tải mỗi file",
-      connectionsHint: "1–4 luồng song song (mặc định 3, như Telegram WebA)",
+      connectionsHint: "1-4 luồng song song (mặc định 3, như Telegram WebA)",
+      aqUntil: "Auto-queue dừng khi", aqUntilLast: "Sau video cuối đã đếm", aqUntilEnd: "Hết slide",
+      aqStatus: "Còn {left} video phía trước · đã qua {seen}",
+      aqStatusSearching: "Đang tìm thêm video tới slide cuối · đã qua {seen}",
       naming: "Định dạng tên file",
       namingOriginal: "Tên gốc", namingDate: "Ngày giờ",
       namingSeq: "Số thứ tự", namingDateOriginal: "Ngày giờ + Tên gốc",
-      namingSeqOriginal: "Số thứ tự + Tên gốc",
+      namingSeqOriginal: "Số thứ tự + Tên gốc", namingCustom: "Tuỳ chỉnh",
+      template: "Mẫu tên file",
+      templateHint: "{name} tên gốc · {date} ngày · {time} giờ · {seq} số thứ tự · {channel} kênh/chat",
       prefix: "Tiền tố (tuỳ chọn)", prefixPlaceholder: "VD: channelname",
       folder: "Thư mục lưu",
       pickFolder: "Chọn thư mục", clearFolder: "Bỏ chọn",
       folderNone: "Chưa chọn (dùng thư mục Downloads mặc định)",
       folderUnsupported: "Trình duyệt không hỗ trợ chọn thư mục",
+      browseFolder: "Xem file trong thư mục lưu", folderLoading: "Đang đọc thư mục…",
+      folderEmpty: "Thư mục trống", folderNoAccess: "Không có quyền đọc thư mục lưu",
+      folderFiles: "Đã lưu trong thư mục \"{name}\" · {n} file, mới nhất ở trên", folderMore: "Chỉ hiện {shown} file mới nhất",
       resetSeq: "Đặt lại số thứ tự", seqNow: "Số kế tiếp: {n}",
       close: "Đóng", clearHistory: "Xoá danh sách tải",
       skippedDownloaded: "Bỏ qua {n} mục đã tải trước đó",
@@ -134,7 +142,6 @@
       preparing: "Preparing", queued: "Queued", downloading: "Downloading",
       paused: "Paused", saving: "Saving", completed: "Completed",
       handedOff: "Browser is downloading", failed: "Failed", cancelled: "Cancelled",
-      resumedTask: "Resuming from {percent}%",
       eta: "{time} left", rate: "{speed}/s",
       video: "video", audio: "audio", image: "image", unknownType: "unknown type",
       errorHttp: "Request failed (HTTP {status})",
@@ -147,6 +154,9 @@
       errorIncomplete: "Incomplete data",
       errorStall: "No data received within 60 seconds",
       errorNoData: "Source returned no data",
+      errorBlobGone: "Telegram released this media; reopen it and download again",
+      skipped: "Already downloaded, skipped",
+      hlsNotFound: "Could not find the HLS source of this video; reopen it and try again",
       errorFatal: "Download failed: {message}",
       selectTitle: "Batch select",
       selectMode: "Select mode", selectAll: "Select all visible",
@@ -159,16 +169,24 @@
       topbarQueue: "Add to queue",
       settings: "Settings", settingsTitle: "Download settings",
       connections: "Connections per file",
-      connectionsHint: "1–4 parallel chunks (default 3, same as Telegram WebA)",
+      connectionsHint: "1-4 parallel chunks (default 3, same as Telegram WebA)",
+      aqUntil: "Auto-queue stops", aqUntilLast: "After the last counted video", aqUntilEnd: "At the last slide",
+      aqStatus: "{left} video(s) ahead · {seen} passed",
+      aqStatusSearching: "Looking for more videos up to the last slide · {seen} passed",
       naming: "File naming",
       namingOriginal: "Original name", namingDate: "Date-time",
       namingSeq: "Sequence number", namingDateOriginal: "Date + Original",
-      namingSeqOriginal: "Sequence + Original",
+      namingSeqOriginal: "Sequence + Original", namingCustom: "Custom",
+      template: "Name template",
+      templateHint: "{name} original name · {date} date · {time} time · {seq} sequence · {channel} channel/chat",
       prefix: "Prefix (optional)", prefixPlaceholder: "e.g. channelname",
       folder: "Destination folder",
       pickFolder: "Pick folder", clearFolder: "Clear",
       folderNone: "Not set (browser Downloads folder)",
       folderUnsupported: "Browser does not support folder picker",
+      browseFolder: "Browse files in the save folder", folderLoading: "Reading folder…",
+      folderEmpty: "Folder is empty", folderNoAccess: "No permission to read the save folder",
+      folderFiles: "Saved in folder \"{name}\" · {n} file(s), newest first", folderMore: "Showing only the {shown} newest files",
       resetSeq: "Reset sequence", seqNow: "Next number: {n}",
       close: "Close", clearHistory: "Clear download list",
       skippedDownloaded: "Skipped {n} already downloaded",
@@ -201,7 +219,7 @@
 
   const defaultLang = () =>
     ((typeof navigator !== "undefined" && navigator.language) || "en").toLowerCase().startsWith("vi") ? "vi" : "en";
-  let currentLang = TEST_MODE ? "vi" : loadStore("lang", defaultLang());
+  let currentLang = loadStore("lang", defaultLang());
   if (!LANGS[currentLang]) currentLang = "en";
   const t = (key, params = {}) =>
     (LANGS[currentLang][key] ?? LANGS.en[key] ?? key).replace(
@@ -246,7 +264,7 @@
   };
 
   const formatDuration = (sec) => {
-    if (!Number.isFinite(sec) || sec < 0) return "–";
+    if (!Number.isFinite(sec) || sec < 0) return "-";
     sec = Math.round(sec);
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
     const pad = (n) => String(n).padStart(2, "0");
@@ -259,10 +277,10 @@
 
   const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+|\*)$/;
 
-  const DEFAULT_SETTINGS = { naming: "original", prefix: "", subfolder: "none", connections: 3 };
-  const settings = Object.assign({}, DEFAULT_SETTINGS, TEST_MODE ? {} : loadStore("settings", {}));
+  const DEFAULT_SETTINGS = { naming: "original", prefix: "", template: "{date}_{name}", subfolder: "none", connections: 3, aqUntil: "last" };
+  const settings = Object.assign({}, DEFAULT_SETTINGS, loadStore("settings", {}));
   const getConnections = () => Math.min(4, Math.max(1, Number(settings.connections) || 3));
-  let seqCounter = TEST_MODE ? 1 : loadStore("seq", 1);
+  let seqCounter = loadStore("seq", 1);
 
   const openIDB = () => new Promise((res, rej) => {
     const r = indexedDB.open("sakerly", 1);
@@ -270,41 +288,36 @@
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
   });
-  const idbGet = async (k) => {
+  // mọi lỗi IndexedDB đều trả null: chỉ mất phần nhớ thư mục
+  const idbReq = async (mode, op) => {
     try {
       const db = await openIDB();
       return await new Promise((res) => {
-        const tx = db.transaction("kv").objectStore("kv").get(k);
-        tx.onsuccess = () => res(tx.result); tx.onerror = () => res(null);
+        const r = op(db.transaction("kv", mode).objectStore("kv"));
+        r.onsuccess = () => res(r.result); r.onerror = () => res(null);
       });
     } catch { return null; }
   };
-  const idbSet = async (k, v) => {
-    try {
-      const db = await openIDB();
-      await new Promise((res) => {
-        const tx = db.transaction("kv", "readwrite").objectStore("kv").put(v, k);
-        tx.onsuccess = () => res(); tx.onerror = () => res();
-      });
-    } catch { /* IndexedDB không dùng được: chỉ mất phần nhớ thư mục */ }
-  };
-  const idbDel = async (k) => {
-    try {
-      const db = await openIDB();
-      await new Promise((res) => {
-        const tx = db.transaction("kv", "readwrite").objectStore("kv").delete(k);
-        tx.onsuccess = () => res(); tx.onerror = () => res();
-      });
-    } catch { /* IndexedDB không dùng được: chỉ mất phần nhớ thư mục */ }
-  };
+  const idbGet = (k) => idbReq("readonly", (s) => s.get(k));
+  const idbSet = (k, v) => idbReq("readwrite", (s) => s.put(v, k));
+  const idbDel = (k) => idbReq("readwrite", (s) => s.delete(k));
 
   // Giữ Blob đằng sau blob: URL do app tạo: tải bằng Blob.slice không qua mạng, vẫn đọc được sau khi app revoke URL
   const BlobRegistry = (() => {
     const map = new Map();
     let totalBytes = 0;
 
+    const mediaSources = new Set();
     const remember = (url, obj) => {
       if (!url || typeof url !== "string" || !url.startsWith("blob:")) return url;
+      if (!(obj instanceof Blob)) {
+        // MediaSource của hls.js: không có dữ liệu để tải, chỉ nhớ để biết video này phải tải qua HLS
+        if (typeof MediaSource !== "undefined" && obj instanceof MediaSource) {
+          mediaSources.add(url);
+          if (mediaSources.size > 50) mediaSources.delete(mediaSources.values().next().value);
+        }
+        return url;
+      }
       const bytes = (obj && typeof obj.size === "number") ? obj.size : 0;
       map.set(url, { obj, bytes, ts: Date.now() });
       totalBytes += bytes;
@@ -342,9 +355,144 @@
       } catch (e) { log.warn("BlobRegistry install failed: " + e.message); }
     };
 
-    return { install, get, remember, size: () => map.size };
+    return { install, get, remember, isMediaSource: (url) => mediaSources.has(url) };
   })();
-  if (!TEST_MODE) BlobRegistry.install();
+  BlobRegistry.install();
+
+  // ---- HLS: video nhiều độ phân giải trên WebK ----
+  // tweb phát qua hls.js (lib/hls): master hls/<JSON> → hls_quality_file/<docId> → các đoạn hls_stream/<JSON> theo byte range.
+  // src của <video> là blob: của MediaSource, không có dữ liệu để đọc: tải lại các đoạn rồi ghép thành một file.
+  const HLS_MASTER_RE = /(^|\/)hls\/(%7B|\{)/i;
+  const hlsToStream = (u) => u.replace(HLS_MASTER_RE, "$1stream/$2"); // master mang DownloadOptions của file gốc
+  const hlsMasters = []; // [{url, at}] master hls.js đã request, mới nhất cuối
+  let ownRequest = false; // request của chính script không tính là "video vừa mở"
+  const ownFetch = (...args) => { ownRequest = true; try { return fetch(...args); } finally { ownRequest = false; } };
+  const noteHlsMaster = (url) => {
+    if (ownRequest || !HLS_MASTER_RE.test(url)) return;
+    const abs = new URL(url, location.href).href;
+    const i = hlsMasters.findIndex((m) => m.url === abs);
+    if (i >= 0) hlsMasters.splice(i, 1);
+    hlsMasters.push({ url: abs, at: Date.now() });
+    if (hlsMasters.length > 20) hlsMasters.shift();
+  };
+  // XHR là loader mặc định của hls.js; fetch cho chắc
+  const watchHlsRequests = () => {
+    try {
+      const nativeOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        try { noteHlsMaster(String(url)); } catch { /* hook không được làm hỏng request của app */ }
+        return nativeOpen.call(this, method, url, ...rest);
+      };
+      const nativeFetch = window.fetch;
+      window.fetch = function (input, ...rest) {
+        try { noteHlsMaster(String(input?.url ?? input)); } catch { /* hook không được làm hỏng request của app */ }
+        return nativeFetch.call(this, input, ...rest);
+      };
+    } catch (e) { log.warn("HLS hook: " + e.message); }
+  };
+
+  const m3uAttrs = (s) => {
+    const out = {};
+    for (const m of s.matchAll(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/g)) out[m[1]] = m[2].replace(/^"|"$/g, "");
+    return out;
+  };
+  const parseHlsMaster = (text, base) => {
+    const lines = text.split(/\r?\n/).map((l) => l.trim());
+    const variants = [];
+    lines.forEach((l, i) => {
+      if (!l.startsWith("#EXT-X-STREAM-INF:")) return;
+      const uri = lines[i + 1];
+      if (!uri || uri.startsWith("#")) return;
+      const a = m3uAttrs(l.slice(18));
+      variants.push({
+        url: new URL(uri, base).href,
+        height: Number((a.RESOLUTION || "").split("x")[1]) || 0,
+        bandwidth: Number(a.BANDWIDTH) || 0,
+      });
+    });
+    return variants;
+  };
+  // các đoạn theo thứ tự (cả EXT-X-MAP); BYTERANGE "len@off", thiếu @off thì nối tiếp đoạn trước của cùng URL
+  const parseHlsMedia = (text, base) => {
+    const parts = [], ends = new Map();
+    let duration = 0, range = null;
+    const add = (uri, br) => {
+      const url = new URL(uri, base).href;
+      const p = { url, start: null, len: null };
+      if (br) {
+        const [len, off] = br.split("@");
+        p.start = off != null ? Number(off) : (ends.get(url) ?? 0);
+        p.len = Number(len);
+        ends.set(url, p.start + p.len);
+      }
+      parts.push(p);
+    };
+    for (const l of text.split(/\r?\n/).map((x) => x.trim())) {
+      if (!l) continue;
+      if (l.startsWith("#EXT-X-MAP:")) { const a = m3uAttrs(l.slice(11)); if (a.URI) add(a.URI, a.BYTERANGE); }
+      else if (l.startsWith("#EXTINF:")) duration += parseFloat(l.slice(8)) || 0;
+      else if (l.startsWith("#EXT-X-BYTERANGE:")) range = l.slice(17);
+      else if (!l.startsWith("#")) { add(l, range); range = null; }
+    }
+    return { parts, duration };
+  };
+  const fetchText = async (url) => {
+    const res = await ownFetch(url);
+    if (!res.ok) throw downloadError("errorHttp", { status: res.status });
+    return res.text();
+  };
+  // Telegram có bản H.264, HEVC và AV1; HEVC/AV1 nhiều trình phát (vd trình phát mặc định của Windows) không mở được
+  const CODEC_RANK = { avc1: 0, avc3: 0, hvc1: 1, hev1: 1, av01: 2 };
+  const detectCodec = (bytes) => {
+    const s = new TextDecoder("latin1").decode(bytes);
+    return Object.keys(CODEC_RANK).find((c) => s.includes(c)) || null;
+  };
+  // master → { parts, duration, height, codec, mime }: bản H.264 cao nhất, không có thì bản cao nhất còn lại;
+  // codec đọc từ đoạn init (moov) vì master của tweb không ghi CODECS. Nhớ lại để tải khỏi đọc lần nữa
+  const hlsPlans = new Map();
+  const loadHlsPlan = (master) => {
+    if (!hlsPlans.has(master)) {
+      const p = (async () => {
+        const variants = parseHlsMaster(await fetchText(master), master)
+          .sort((a, b) => b.height - a.height || b.bandwidth - a.bandwidth);
+        const cands = [];
+        for (const v of variants) {
+          try {
+            const media = parseHlsMedia(await fetchText(v.url), v.url);
+            if (!media.parts.length) continue;
+            const init = media.parts[0];
+            let codec = null;
+            try { codec = detectCodec(await fetchRangeBytes(init.url, init.start ?? 0, init.len ?? 65536, undefined, true)); }
+            catch { /* không đọc được init: coi như codec lạ */ }
+            const seg = getMediaMetadata(media.parts.at(-1).url); // hls_stream JSON: {docId, dcId, size, mimeType}
+            cands.push({ ...media, height: v.height, codec, mime: typeof seg?.mimeType === "string" ? seg.mimeType : "video/mp4" });
+            if (CODEC_RANK[codec] === 0) break; // đã sắp cao nhất trước: bản H.264 đầu tiên là tốt nhất
+          } catch (e) { log.warn(`HLS ${v.height}p: ${e.message}`); }
+        }
+        if (!cands.length) throw new Error("HLS: không đọc được bản nào trong playlist");
+        const rank = (c) => CODEC_RANK[c.codec] ?? 1.5;
+        return cands.reduce((a, b) => (rank(b) < rank(a) ? b : a));
+      })();
+      p.catch(() => hlsPlans.delete(master));
+      hlsPlans.set(master, p);
+      if (hlsPlans.size > 20) hlsPlans.delete(hlsPlans.keys().next().value);
+    }
+    return hlsPlans.get(master);
+  };
+  // master của video đang mở: MediaSource lấy duration từ chính playlist nên thời lượng phải khớp
+  const findHlsMaster = async (video, strict = false) => {
+    const durOk = () => video.duration > 0 && Number.isFinite(video.duration);
+    for (let i = 0; i < 50 && !durOk(); i++) await sleep(100);
+    const dur = durOk() ? video.duration : null;
+    if (dur == null && strict) return null;
+    for (const m of [...hlsMasters].reverse()) {
+      try {
+        const plan = await loadHlsPlan(m.url);
+        if (dur == null || Math.abs(plan.duration - dur) < 1.5) return m.url;
+      } catch (e) { log.warn(e.message); }
+    }
+    return null;
+  };
 
   class SpeedMeter {
     constructor(windowMs = 3000) {
@@ -408,8 +556,8 @@
       if (this.total == null) {
         // chưa biết tổng dung lượng: chỉ 1 worker dẫn đầu với claim vô hạn + hint size
         if (this.claimed.length || this.done.length) return null;
-        this.claimed.push([0, InfinityMarker]);
-        return { start: 0, end: InfinityMarker, size };
+        this.claimed.push([0, Infinity]);
+        return { start: 0, end: Infinity, size };
       }
       let cursor = 0;
       const busy = [...this.done, ...this.claimed].sort((a, b) => a[0] - b[0]);
@@ -471,24 +619,6 @@
 
     hasClaims() { return this.claimed.length > 0; }
   }
-  const InfinityMarker = Infinity;
-
-  const NetBudget = {
-    active: 0,
-    waiters: [],
-    async acquire(bytes) {
-      if (this.active + bytes <= NET_BUDGET_BYTES) { this.active += bytes; return; }
-      await new Promise((resolve) => { this.waiters.push({ resolve, bytes }); });
-    },
-    release(bytes) {
-      this.active = Math.max(0, this.active - bytes);
-      while (this.waiters.length && this.active + this.waiters[0].bytes <= NET_BUDGET_BYTES) {
-        const w = this.waiters.shift();
-        this.active += w.bytes;
-        w.resolve();
-      }
-    },
-  };
 
   // ghi theo vị trí nên chunk lệch thứ tự vẫn đúng; keepExistingData cho Retry chỉ vá phần thiếu
   class FsWriter {
@@ -504,11 +634,13 @@
     }
     async open(keepExisting = false) {
       if (this.writable && !this.closed) return this.writable;
-      this.writable = await this.handle.createWritable(
-        keepExisting ? { keepExistingData: true } : {}
-      );
-      this.closed = false;
-      return this.writable;
+      // gọi song song chỉ mở một writable: hai writable trên cùng file thì cái đóng sau đè mất dữ liệu cái kia
+      if (!this._opening) {
+        this._opening = this.handle.createWritable(keepExisting ? { keepExistingData: true } : {})
+          .then((w) => { this.writable = w; this.closed = false; return w; })
+          .finally(() => { this._opening = null; });
+      }
+      return this._opening;
     }
     async writeAt(position, data) {
       const w = await this.open();
@@ -522,24 +654,20 @@
       if (this.writable && !this.closed) { try { await this.writable.abort(); } catch { /* stream đã đóng */ } }
       this.closed = true; this.writable = null;
     }
-    get isClosed() { return this.closed || !this.writable; }
   }
 
   // dự phòng cho trình duyệt không có File System Access
   class MemWriter {
-    constructor() { this.parts = new Map(); this._bytes = 0; }
+    constructor() { this.parts = new Map(); }
     // LazyWriter gọi open() khi resume; MemWriter không cần mở lại gì
     async open() {}
-    async writeAt(position, data) { this.parts.set(position, data); this._bytes += data.byteLength; }
-    get bytes() { return this._bytes; }
-    get size() { return this.parts.size; }
+    async writeAt(position, data) { this.parts.set(position, data); }
     assemble(mime) {
       const offsets = [...this.parts.keys()].sort((a, b) => a - b);
       return new Blob(offsets.map((o) => this.parts.get(o)), { type: mime || "application/octet-stream" });
     }
     async close() {}
-    async abort() { this.parts.clear(); this._bytes = 0; }
-    get isClosed() { return false; }
+    async abort() { this.parts.clear(); }
   }
 
   const tagError = (err, { retryable = false, fatal = false } = {}) => {
@@ -569,7 +697,6 @@
       : CHUNK_MAX;
     const reqEnd = claim.start + reqSpan - 1;
 
-    await NetBudget.acquire(reqSpan);
     const controller = new AbortController();
     const relayAbort = () => controller.abort(signal.reason);
     if (signal.aborted) relayAbort();
@@ -589,7 +716,7 @@
     let chunkReceived = 0; // tính vào task.inflight tới khi ghi xong
     try {
       resetStall();
-      const res = await fetch(task.url, {
+      const res = await fetch(task.fetchUrl || task.url, {
         headers: { Range: `bytes=${claim.start}-${reqEnd}` },
         signal: controller.signal,
       });
@@ -675,14 +802,17 @@
       if (!signal.aborted && controller.signal.aborted) {
         throw tagError(controller.signal.reason || downloadError("errorStall", {}, "TimeoutError"), { retryable: true });
       }
-      if (err instanceof TypeError) tagError(err, { retryable: true });
+      if (err instanceof TypeError) {
+        // blob: lỗi mạng nghĩa là app đã thu hồi URL: thử lại bao nhiêu lần cũng vô ích
+        if (task.url.startsWith("blob:")) throw tagError(downloadError("errorBlobGone"), { fatal: true });
+        tagError(err, { retryable: true });
+      }
       throw err;
     } finally {
       clearStall();
       signal.removeEventListener("abort", relayAbort);
       if (reader) { await reader.cancel().catch(() => {}); reader = null; }
       task.inflight = Math.max(0, (task.inflight || 0) - chunkReceived);
-      NetBudget.release(reqSpan);
       bumpProgress(task);
     }
   }
@@ -728,7 +858,7 @@
   async function parallelRangeDownload(task) {
     const ledger = task.ledger || (task.ledger = new RangeLedger());
     let chunkSize = task.chunkSize || CHUNK_DEFAULT;
-    const isWebKStream = /\/stream\//.test(task.url);
+    const isWebKStream = /\/stream\//.test(task.fetchUrl || task.url);
     let fullStreak = 0;
 
     const worker = async () => {
@@ -817,8 +947,103 @@
 
   const PAUSE_SIGNAL = Object.assign(new Error("paused"), { name: "PauseSignal", pause: true });
 
+  // đúng đoạn [start, start+len) của url; SW có thể trả 200 cả file, hoặc 206 bắt đầu sớm hơn (theo Content-Range): cắt lấy phần cần
+  const fetchRangeBytes = async (url, start, len, signal, own = false) => {
+    const headers = len != null ? { Range: `bytes=${start}-${start + len - 1}` } : {};
+    const res = await (own ? ownFetch : fetch)(url, { headers, signal });
+    if (!res.ok) {
+      const retry = res.status >= 500 || res.status === 429;
+      throw tagError(downloadError("errorHttp", { status: res.status }), { retryable: retry, fatal: !retry });
+    }
+    let buf = new Uint8Array(await res.arrayBuffer());
+    if (len != null) {
+      const cr = res.status === 206 ? res.headers.get("Content-Range")?.match(CONTENT_RANGE_RE) : null;
+      const from = res.status === 206 ? (cr ? start - Number(cr[1]) : 0) : start;
+      if (from < 0) throw tagError(downloadError("errorRangeInconsistent"), { fatal: true });
+      buf = buf.subarray(from, from + len);
+      if (buf.byteLength !== len) throw tagError(downloadError("errorIncomplete"), { retryable: true });
+    }
+    if (!buf.byteLength) throw tagError(downloadError("errorEmpty"), { retryable: true });
+    return buf;
+  };
+
+  // file gốc có tải được qua stream/ không (SW của WebK từ chối một số file, vd .mov)
+  const probeStream = async (url) => {
+    try {
+      const res = await ownFetch(url, { headers: { Range: "bytes=0-1" } });
+      res.body?.cancel().catch(() => {});
+      return res.status === 206 && CONTENT_RANGE_RE.test(res.headers.get("Content-Range") || "");
+    } catch { return false; }
+  };
+
+  async function fetchHlsPart(task, p) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fetchRangeBytes(p.url, p.start, p.len, task.controller.signal);
+      } catch (err) {
+        if (task.pauseFlag) throw PAUSE_SIGNAL;
+        if (task.controller.signal.aborted) throw task.controller.signal.reason || err;
+        if (err?.fatal || attempt + 1 >= CHUNK_RETRIES) throw tagError(err, { retryable: !err?.fatal });
+        await sleep(backoffDelay(attempt + 1), task.controller.signal);
+      }
+    }
+  }
+
+  // tải các đoạn của bản cao nhất và ghi nối tiếp nhau (init + fragment = file mp4 xem được);
+  // task.hlsDone nhớ đoạn đã ghi để Tạm dừng/Tiếp tục và tự thử lại không tải lại từ đầu
+  async function hlsDownload(task) {
+    // ưu tiên file gốc qua stream/ (như video thường, đúng file người gửi đăng); SW từ chối thì mới ghép HLS
+    if (task.hlsMode == null) task.hlsMode = (await probeStream(hlsToStream(task.url))) ? "original" : "merge";
+    if (task.hlsMode === "original") {
+      task.fetchUrl = hlsToStream(task.url);
+      log.info("HLS: tải file gốc qua stream/", task.fileName);
+      return parallelRangeDownload(task);
+    }
+    const plan = await loadHlsPlan(task.url);
+    task.mime = plan.mime;
+    if (!task.named) task.fileName = getDownloadFileName(task.url, task.mime, task.kind);
+    const parts = plan.parts;
+    const sized = parts.every((p) => p.len != null);
+    if (!sized || !task.hlsDone) { task.hlsDone = new Set(); task.receivedDirect = 0; } // không biết vị trí ghi thì làm lại từ đầu
+    task.ledger = null;
+    task.total = sized ? parts.reduce((s, p) => s + p.len, 0) : null;
+    const offsets = [];
+    parts.reduce((off, p, i) => { offsets[i] = off; return off + (p.len ?? 0); }, 0);
+    log.info(`HLS ${plan.height}p ${plan.codec || "?"}: ${parts.length} đoạn${task.total ? ", " + formatBytes(task.total) : ""}`, task.fileName);
+
+    let next = 0, seqPos = 0;
+    const worker = async () => {
+      try {
+        while (next < parts.length) {
+          if (task.controller.signal.aborted) throw task.controller.signal.reason;
+          if (task.pauseFlag) throw PAUSE_SIGNAL;
+          const i = next++;
+          if (task.hlsDone.has(i)) continue;
+          const buf = await fetchHlsPart(task, parts[i]);
+          const pos = sized ? offsets[i] : seqPos;
+          if (!sized) seqPos += buf.byteLength;
+          await task.writer.writeAt(pos, buf);
+          task.hlsDone.add(i);
+          task.meter.push(buf.byteLength);
+          task.receivedDirect += buf.byteLength;
+          bumpProgress(task);
+        }
+      } catch (err) {
+        // một luồng lỗi thì dừng cả task, như parallelRangeDownload
+        if (!task.pauseFlag && !task.controller.signal.aborted) {
+          try { task.controller.abort(err); } catch { /* controller đã bị hủy */ }
+        }
+        throw err;
+      }
+    };
+    await Promise.all(Array.from({ length: sized ? getConnections() : 1 }, worker));
+    if (task.hlsDone.size < parts.length) throw tagError(downloadError("errorIncomplete"), { retryable: true });
+  }
+
   async function engineDownload(task) {
-    const blobObj = task.url.startsWith("blob:") ? BlobRegistry.get(task.url) : null;
+    if (HLS_MASTER_RE.test(task.url)) return hlsDownload(task);
+    await task.blobReady;
+    const blobObj = task.blob || (task.url.startsWith("blob:") ? BlobRegistry.get(task.url) : null);
     if (blobObj instanceof Blob) {
       log.info(`blob fast-path (${formatBytes(blobObj.size)})`, task.fileName);
       await downloadFromBlob(task, blobObj);
@@ -876,7 +1101,7 @@
     return `url:${u}`;
   };
 
-  let downloadedKeys = new Set(TEST_MODE ? [] : loadStore("downloaded", []));
+  let downloadedKeys = new Set(loadStore("downloaded", []));
   const markDownloaded = (key) => {
     if (!key || key.startsWith("url:")) return; // blob: URL chết theo trang
     downloadedKeys.delete(key);
@@ -932,11 +1157,21 @@
     const base = dot > 0 ? originalName.slice(0, dot) : originalName;
     const ext = dot > 0 ? originalName.slice(dot) : "";
     const prefix = settings.prefix ? sanitizeName(settings.prefix) + "_" : "";
+    let seqValue = null; // {seq} xuất hiện nhiều lần trong mẫu vẫn chỉ tiêu một số
     const seq = () => {
-      const s = pad3(seqCounter);
+      if (seqValue != null) return seqValue;
+      seqValue = pad3(seqCounter);
       if (!peek) { seqCounter++; saveStore("seq", seqCounter); }
-      return s;
+      return seqValue;
     };
+    if (settings.naming === "custom") {
+      const tokens = {
+        name: () => base, date: todaySegment, time: () => nowStamp().slice(9), seq, channel: currentChannelName,
+      };
+      const out = String(settings.template || "").replace(/\{(\w+)\}/g, (ph, k) => (tokens[k] ? tokens[k]() : ph));
+      // sanitizeName bỏ cả "/" nên mẫu không tạo được thư mục con; 150 ký tự để còn chỗ cho đuôi và " (n)"
+      return prefix + (sanitizeName(out).trim().slice(0, 150) || base) + ext;
+    }
     switch (settings.naming) {
       case "date": return prefix + nowStamp() + ext;
       case "seq": return prefix + seq() + ext;
@@ -947,8 +1182,8 @@
   };
 
   let destDirHandle = null;
-  let destDirName = TEST_MODE ? "" : loadStore("destDirName", "");
-  if (!TEST_MODE) idbGet("destDirHandle").then((h) => { if (h) destDirHandle = h; });
+  let destDirName = loadStore("destDirName", "");
+  idbGet("destDirHandle").then((h) => { if (h) destDirHandle = h; });
 
   const ensureDirPermission = async (handle) => {
     if (!handle) return false;
@@ -990,7 +1225,7 @@
     return dir;
   };
   // không ghi đè: a.jpg → a (1).jpg → a (2).jpg
-  const uniqueFileHandle = async (dir, name) => {
+  const pickFreeFile = async (dir, name) => {
     const dot = name.lastIndexOf(".");
     const base = dot > 0 ? name.slice(0, dot) : name;
     const ext = dot > 0 ? name.slice(dot) : "";
@@ -1004,6 +1239,35 @@
       }
     }
     throw new Error(`too many files named ${name}`);
+  };
+  // chạy lần lượt: 2 task cùng tên chạy song song sẽ cùng thấy "chưa có file" rồi ghi đè lên nhau
+  let fileNameChain = Promise.resolve();
+  const uniqueFileHandle = (dir, name) => {
+    const run = () => pickFreeFile(dir, name);
+    const p = fileNameChain.then(run, run);
+    fileNameChain = p.catch(() => {});
+    return p;
+  };
+
+  // mọi file trong thư mục lưu, kể cả thư mục con ngày/kênh, mới nhất trước; bỏ file tạm .crswap của file đang ghi
+  const listSavedFiles = async (root) => {
+    const out = [];
+    const walk = async (dir, prefix) => {
+      for await (const h of dir.values()) {
+        if (out.length >= FILE_LIST_SCAN_MAX) return;
+        if (h.kind === "directory") { await walk(h, `${prefix}${h.name}/`); continue; }
+        if (h.name.endsWith(".crswap")) continue;
+        try { out.push({ path: prefix + h.name, file: await h.getFile() }); } catch { /* file vừa bị xoá hoặc đang bị khoá */ }
+      }
+    };
+    await walk(root, "");
+    return out.sort((a, b) => b.file.lastModified - a.file.lastModified);
+  };
+
+  // đặt tên theo cài đặt đúng một lần mỗi task (tiền tố, số thứ tự); file người dùng tự chọn giữ nguyên tên
+  const nameOnce = (task) => {
+    if (!task.named && !task.handle) { task.fileName = applyNaming(task.fileName); task.named = true; }
+    return task.fileName;
   };
 
   // chạy lần lượt, cách 400ms, để Chrome không chặn vì "tải nhiều file"
@@ -1037,17 +1301,20 @@
 
   // chỉ tạo file thật khi chunk đầu về, lúc đã biết mime và tên
   class LazyWriter {
-    constructor(task) { this.task = task; this.inner = null; }
-    async _ensure() {
-      if (this.inner) return this.inner;
+    constructor(task) { this.task = task; this.inner = null; this._ready = null; }
+    // nhiều luồng ghi đoạn đầu cùng lúc (HLS, blob): chỉ tạo một file, các luồng khác đợi rồi ghi chung
+    _ensure() {
+      if (!this._ready) this._ready = this._create().catch((e) => { this._ready = null; this.inner = null; throw e; });
+      return this._ready;
+    }
+    async _create() {
       const task = this.task;
       if (task.handle) {
         this.inner = FsWriter.supported ? new FsWriter(task.handle) : new MemWriter();
       } else {
         const dir = await resolveDestDir();
         if (dir && FsWriter.supported) {
-          task.fileName = applyNaming(task.fileName);
-          const { fh, name } = await uniqueFileHandle(dir, task.fileName);
+          const { fh, name } = await uniqueFileHandle(dir, nameOnce(task));
           task.fileName = name;
           task._createdFile = fh;
           this.inner = new FsWriter(fh);
@@ -1101,7 +1368,8 @@
     task.state = state; task.error = error;
     task.speed = 0; task.eta = null;
     if (activeTasks.get(task.key) === task) activeTasks.delete(task.key);
-    if (state === "completed" || state === "handedOff") markDownloaded(task.mediaKey);
+    if (state === "completed" || state === "handedOff") { markDownloaded(task.mediaKey); task.blob = null; }
+    if (task.dismissed) downloadTasks.delete(task.id);
     if (error) log.error(error.message || String(error), task.fileName);
     renderTask(task);
     updatePanelCounts();
@@ -1135,6 +1403,7 @@
       } else {
         // mime chỉ chắc chắn sau chunk cuối nên tính lại đuôi file
         task.fileName = applyNaming(getDownloadFileName(task.url, task.mime, task.kind));
+        task.named = true;
         renderTask(task);
         const blob = real.assemble(task.mime);
         const dir = await resolveDestDir();
@@ -1163,11 +1432,17 @@
         finishTask(task, "cancelled");
         return;
       }
+      // Resume bấm khi pause chưa dừng hẳn: pumpQueue đã bỏ qua task vì nó còn chạy, nên chạy tiếp ngay tại đây
+      if (err?.pause || signalReason?.pause) {
+        task.controller = new AbortController();
+        task.running = false;
+        return runTask(task);
+      }
       if (err?.handoff && err.handoffUrl) {
         log.warn("handing off to native download endpoint (large file, no FS Access)", task.fileName);
         task.usedNativeFallback = true;
         try {
-          await saveMediaBlob(null, applyNaming(task.fileName), err.handoffUrl);
+          await saveMediaBlob(null, nameOnce(task), err.handoffUrl);
           finishTask(task, "handedOff");
           return;
         } catch (e) { log.error("native handoff failed: " + e.message); }
@@ -1192,19 +1467,23 @@
         finishTask(task, "cancelled");
         return;
       }
-      // commit phần đã tải để Retry tiếp tục từ đó
-      if (task.writer) { try { await task.writer.close(); } catch { /* commit phần đã tải chỉ là cố gắng thêm */ } }
-      if (!task.usedNativeFallback) {
-        const fb = webaDownloadFallback(task.url, applyNaming(task.fileName));
-        if (fb) {
-          task.usedNativeFallback = true;
-          log.warn("falling back to native download endpoint", task.fileName);
-          try {
-            await saveMediaBlob(null, task.fileName, fb);
-            finishTask(task, "handedOff");
-            return;
-          } catch (e) { log.error("native fallback failed: " + e.message); }
-        }
+      // kiểm tra URL trước rồi mới đặt tên, để lỗi không có đường dự phòng không tiêu số thứ tự
+      const fb = !task.usedNativeFallback && webaDownloadFallback(task.url)
+        ? webaDownloadFallback(task.url, nameOnce(task)) : null;
+      if (fb) {
+        task.usedNativeFallback = true;
+        log.warn("falling back to native download endpoint", task.fileName);
+        // trình duyệt tải bản đầy đủ: bỏ file dở dang trong thư mục lưu, Retry sau đó tải lại từ đầu
+        await task.writer?.abort(); await task.writer?.discardCreatedFile?.();
+        task.ledger = null; task.writer = null;
+        try {
+          await saveMediaBlob(null, task.fileName, fb);
+          finishTask(task, "handedOff");
+          return;
+        } catch (e) { log.error("native fallback failed: " + e.message); }
+      } else if (task.writer) {
+        // commit phần đã tải để Retry tiếp tục từ đó
+        try { await task.writer.close(); } catch { /* commit phần đã tải chỉ là cố gắng thêm */ }
       }
       finishTask(task, "failed", err);
     } finally {
@@ -1222,10 +1501,22 @@
     }
   };
 
+  // media đã tải trước đó: hiện một thẻ trong panel, không thì người dùng tưởng nút không chạy
+  const noteSkipped = (url, kind) => {
+    const task = {
+      id: "skip-" + Math.random().toString(36).slice(2) + Date.now().toString(36), url, kind,
+      fileName: getDownloadFileName(url, getMediaMetadata(url)?.mimeType, kind),
+      state: "skipped", received: 0, total: null, speed: 0, eta: null, finished: true,
+    };
+    downloadTasks.set(task.id, task);
+    renderTask(task, true);
+    log.info(t("skipped"), task.fileName);
+  };
+
   const downloadMedia = (url, kind, opts = {}) => {
     if (typeof url !== "string" || !url) return Promise.resolve();
     const mk = opts.mediaKey || mediaKey(url);
-    if (opts.skipDownloaded && downloadedKeys.has(mk)) return Promise.resolve({ state: "skipped" });
+    if (opts.skipDownloaded && downloadedKeys.has(mk)) { noteSkipped(url, kind); return Promise.resolve({ state: "skipped" }); }
     const key = `${kind}:${mk}`;
     const existing = activeTasks.get(key);
     if (existing && !existing.finished) {
@@ -1257,7 +1548,15 @@
       meter: new SpeedMeter(),
       startedAt: performance.now(), finished: false,
       pauseFlag: false, cancelRequested: false,
+      // giữ Blob ngay khi xếp hàng: tới lượt tải thì app có thể đã thu hồi URL và registry đã đẩy nó ra
+      blob: url.startsWith("blob:") ? BlobRegistry.get(url) : null,
     };
+    // blob do worker của WebK tạo không đi qua hook nên registry không có: đọc ngay khi media còn trên màn hình,
+    // tới lượt tải thì app đã thu hồi URL (ERR_FILE_NOT_FOUND)
+    if (url.startsWith("blob:") && !task.blob) {
+      task.blobReady = fetch(url).then((r) => r.blob())
+        .then((b) => { task.blob = b; }, (e) => log.warn("blob capture: " + e.message, task.fileName));
+    }
     task.promise = new Promise((r) => (task.resolve = r));
     downloadTasks.set(task.id, task);
     activeTasks.set(key, task);
@@ -1328,6 +1627,8 @@
 
   const retryTask = (task) => {
     if (!task.finished || !["failed", "cancelled"].includes(task.state)) return;
+    // hủy đã xoá phần đã tải (bộ nhớ hoặc file), nên phải tải lại từ đầu, không resume
+    if (task.state === "cancelled") { task.ledger = null; task.writer = null; task.hlsDone = null; }
     task.finished = false;
     task.error = null;
     task.state = "queued";
@@ -1338,6 +1639,8 @@
     if (task.ledger && !task.ledger.isComplete()) {
       task.resumeMode = true;
       log.info(`retry-resume: còn thiếu ${formatBytes(task.ledger.remaining)}`, task.fileName);
+    } else if (task.hlsDone?.size) {
+      task.resumeMode = true; // giữ các đoạn HLS đã ghi (file đã được commit khi lỗi)
     } else {
       task.ledger = null;
       task.meter = new SpeedMeter();
@@ -1357,6 +1660,8 @@
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 15v4h14v-4"/><path d="M12 4v10"/><path d="M8 10l4 4 4-4"/><circle cx="18" cy="6" r="3" fill="currentColor" stroke="none"/></svg>';
   const GEAR_SVG =
     '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>';
+  const FOLDER_SVG =
+    '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>';
   const TRASH_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
 
@@ -1400,14 +1705,29 @@
       #sk-panel {
         right: max(16px, env(safe-area-inset-right));
         bottom: max(16px, env(safe-area-inset-bottom));
-        width: min(370px, calc(100vw - 32px)); max-height: min(calc(100vh - 32px), 620px);
+        width: min(370px, calc(100vw - 32px)); max-height: min(calc(100vh - 32px), 620px, var(--sk-room, 100vh));
       }
       #sk-panel.collapsed .sk-task-list, #sk-panel.collapsed .sk-foot,
-      #sk-panel.collapsed .sk-empty { display: none; }
+      #sk-panel.collapsed .sk-empty, #sk-panel.collapsed .sk-file-list { display: none; }
+      /* chế độ xem file thay chỗ danh sách task */
+      #sk-panel.files .sk-task-list, #sk-panel:not(.files) .sk-file-list { display: none; }
+      .sk-file-list {
+        overflow-y: auto; overscroll-behavior: contain; padding: 10px;
+        display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 0;
+      }
+      .sk-file-head, .sk-file-msg { font-size: 12px; color: var(--sk-muted); padding: 2px; }
+      .sk-file-msg { text-align: center; padding: 12px 2px; }
+      .sk-file {
+        color: var(--sk-fg); border: 1px solid var(--sk-line); border-radius: 10px;
+        padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0;
+      }
+      .sk-file .name { font-weight: 600; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sk-file .meta { font-size: 11.5px; color: var(--sk-muted); font-variant-numeric: tabular-nums; }
+      .sk-icon-btn.on { background: var(--sk-accent); color: var(--sk-accent-fg); }
       #sk-select {
         right: max(16px, env(safe-area-inset-right));
         top: max(16px, env(safe-area-inset-top));
-        width: min(320px, calc(100vw - 32px)); max-height: 70vh;
+        width: min(320px, calc(100vw - 32px)); max-height: min(70vh, var(--sk-room, 100vh));
       }
       #sk-select.collapsed { width: auto; }
       #sk-select.collapsed .sk-select-body { display: none; }
@@ -1540,6 +1860,10 @@
         font-size: 11px; color: var(--sk-muted); border-top: 1px solid var(--sk-line);
       }
 
+      .sk-aq-status {
+        margin: 0 0 8px; padding: 7px 10px; border-radius: 9px; font-size: 12px; font-weight: 600;
+        background: var(--sk-accent-soft); color: var(--sk-accent-chip); font-variant-numeric: tabular-nums;
+      }
       .sk-select-body {
         padding: 10px 12px; overflow-y: auto; overscroll-behavior: contain;
         flex: 1 1 auto; min-height: 0;
@@ -1660,11 +1984,6 @@
     document.head.appendChild(style);
   };
 
-  const STATE_ORDER_LABEL = (task) => {
-    if (task.state === "downloading" && task.resumeMode) return t("resumedTask", { percent: task.total ? Math.floor(task.received * 100 / task.total) : 0 });
-    return t(task.state);
-  };
-
   const attachTaskCard = (task) => {
     const list = document.querySelector("#sk-panel .sk-task-list");
     if (!list) return null;
@@ -1699,9 +2018,12 @@
     return card;
   };
 
+  // X trên task chưa xong = hủy luôn; nếu chỉ gỡ card, task vẫn chạy/tự thử lại và card hiện lại ở lần vẽ sau
   const dismissTask = (task) => {
+    task.dismissed = true;
     document.getElementById("sk-task-" + task.id)?.remove();
     if (task.finished) downloadTasks.delete(task.id);
+    else cancelTask(task);
     updatePanelCounts();
   };
 
@@ -1716,7 +2038,7 @@
 
   const renderTaskImpl = (task, scroll = false) => {
     const panel = document.getElementById("sk-panel");
-    if (!panel) return;
+    if (!panel || task.dismissed) return;
     let card = document.getElementById("sk-task-" + task.id);
     if (!card) {
       card = attachTaskCard(task);
@@ -1725,7 +2047,7 @@
       if (!panelUserCollapsed) {
         panel.classList.remove("collapsed");
         const toggle = panel.querySelector(".sk-toggle");
-        toggle.textContent = "–"; toggle.title = t("hide");
+        toggle.textContent = "-"; toggle.title = t("hide");
       }
     }
     if (scroll) scrollCardInsideList(card);
@@ -1742,14 +2064,14 @@
     bar.querySelector(".sk-bar-fill").style.width = (pct ?? 0) + "%";
 
     card.querySelector(".state-label").textContent =
-      task.state === "downloading" && pct !== null ? `${intFmt().format(pct)}% · ${t("downloading")}` : STATE_ORDER_LABEL(task);
+      task.state === "downloading" && pct !== null ? `${intFmt().format(pct)}% · ${t("downloading")}` : t(task.state);
 
     const parts = [formatBytes(task.received) + (task.total != null ? ` / ${formatBytes(task.total)}` : "")];
     if (task.state === "downloading" && task.speed) {
       parts.push(t("rate", { speed: formatBytes(task.speed) }));
       if (task.eta != null && task.eta > 1) parts.push(t("eta", { time: formatDuration(task.eta) }));
     }
-    card.querySelector(".detail").textContent = parts.join(" · ");
+    card.querySelector(".detail").textContent = task.state === "skipped" ? "" : parts.join(" · ");
 
     const errEl = card.querySelector(".sk-err-text");
     errEl.textContent = formatError(task.error);
@@ -1799,13 +2121,14 @@
           <span class="sk-logo">${TG_LOGO_SVG}</span>
           <span class="sk-title-text">${t("downloads")}</span>
         </div>
+        <button type="button" class="sk-icon-btn sk-folder-btn" title="" hidden>${FOLDER_SVG}</button>
         <button type="button" class="sk-icon-btn sk-clear" title="">${TRASH_SVG}</button>
-        <button type="button" class="sk-icon-btn sk-settings-btn" title="">${GEAR_SVG}</button>
-        <button type="button" class="sk-icon-btn sk-toggle" title="">–</button>
+        <button type="button" class="sk-icon-btn sk-toggle" title="">-</button>
       </div>
       <div class="sk-task-list">
         <div class="sk-empty" hidden></div>
       </div>
+      <div class="sk-file-list"></div>
       <div class="sk-foot">
         <span>SakerLy</span>
         <span>v${SCRIPT_VERSION}</span>
@@ -1817,7 +2140,7 @@
       const col = !panel.classList.contains("collapsed");
       panel.classList.toggle("collapsed", col);
       panelUserCollapsed = col;
-      panelToggle.textContent = col ? "+" : "–";
+      panelToggle.textContent = col ? "+" : "-";
       panelToggle.title = col ? t("show") : t("hide");
     };
     // xoá mọi task trừ task đang tải; card mồ côi cũng bị dọn
@@ -1835,7 +2158,14 @@
       updatePanelCounts();
     };
     panel.querySelector(".sk-clear").title = t("clearHistory");
-    panel.querySelector(".sk-settings-btn").onclick = () => { settingsModal.hidden = false; refreshSettingsUI(); };
+    panel.querySelector(".sk-folder-btn").onclick = () => {
+      const on = !panel.classList.contains("files");
+      panel.classList.toggle("files", on);
+      panel.querySelector(".sk-folder-btn").classList.toggle("on", on);
+      if (on && panel.classList.contains("collapsed")) panelToggle.click();
+      if (on) renderFileList();
+    };
+    updateFolderBtn();
     makeDraggable(panel, panel.querySelector(".sk-head"), "panelPos");
 
     selectBar = document.createElement("section");
@@ -1848,7 +2178,7 @@
         </div>
         <span class="sk-count sk-sel-count">0</span>
         <button type="button" class="sk-icon-btn sk-select-settings" title="">${GEAR_SVG}</button>
-        <button type="button" class="sk-icon-btn sk-select-toggle" title="">–</button>
+        <button type="button" class="sk-icon-btn sk-select-toggle" title="">-</button>
       </div>
       <div class="sk-select-body">
         <div class="sk-hint sk-hint-box"></div>
@@ -1856,6 +2186,7 @@
           <button type="button" id="sk-mode-btn" class="sk-btn toggle"></button>
           <button type="button" id="sk-auto-btn" class="sk-btn toggle"></button>
         </div>
+        <div class="sk-aq-status" role="status" hidden></div>
         <div class="sk-actions">
           <button type="button" id="sk-all-btn" class="sk-btn"></button>
           <button type="button" id="sk-clear-btn" class="sk-btn"></button>
@@ -1870,7 +2201,7 @@
     selToggle.onclick = () => {
       const col = !selectBar.classList.contains("collapsed");
       selectBar.classList.toggle("collapsed", col);
-      selToggle.textContent = col ? "+" : "–";
+      selToggle.textContent = col ? "+" : "-";
       selToggle.title = col ? t("show") : t("hide");
     };
     selectBar.querySelector(".sk-select-settings").onclick = () => {
@@ -1921,6 +2252,13 @@
               </label>
             </div>
             <div class="hint" data-key="connectionsHint"></div>
+            <label class="sk-field">
+              <span class="label" data-key="aqUntil"></span>
+              <select class="sk-settings-aquntil">
+                <option value="last" data-key="aqUntilLast"></option>
+                <option value="end" data-key="aqUntilEnd"></option>
+              </select>
+            </label>
           </section>
 
           <section class="sk-set-section">
@@ -1934,6 +2272,7 @@
                   <option value="seq" data-key="namingSeq"></option>
                   <option value="date_original" data-key="namingDateOriginal"></option>
                   <option value="seq_original" data-key="namingSeqOriginal"></option>
+                  <option value="custom" data-key="namingCustom"></option>
                 </select>
               </label>
               <label class="sk-field">
@@ -1941,6 +2280,11 @@
                 <input type="text" class="sk-settings-prefix" maxlength="60">
               </label>
             </div>
+            <label class="sk-field sk-template-field" hidden>
+              <span class="label" data-key="template"></span>
+              <input type="text" class="sk-settings-template" maxlength="120" placeholder="{channel}_{date}_{name}">
+              <span class="hint" data-key="templateHint"></span>
+            </label>
             <div class="sk-name-preview"><span class="k" data-key="namingPreview"></span><span class="v"></span></div>
           </section>
 
@@ -1950,7 +2294,7 @@
             <div class="sk-field">
               <span class="label" data-key="folder"></span>
               <div class="sk-folder-row">
-                <span class="sk-folder-chip"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg><span class="name sk-folder-name"></span></span>
+                <span class="sk-folder-chip">${FOLDER_SVG}<span class="name sk-folder-name"></span></span>
                 <button type="button" class="sk-btn sk-pickdir"></button>
                 <button type="button" class="sk-btn sk-danger sk-cleardir" hidden></button>
               </div>
@@ -1988,8 +2332,11 @@
       title: settingsModal.querySelector("h3"),
       lang: settingsModal.querySelector(".sk-lang-select"),
       conn: settingsModal.querySelector(".sk-settings-connections"),
+      aqUntil: settingsModal.querySelector(".sk-settings-aquntil"),
       naming: settingsModal.querySelector(".sk-settings-naming"),
       prefix: settingsModal.querySelector(".sk-settings-prefix"),
+      template: settingsModal.querySelector(".sk-settings-template"),
+      templateField: settingsModal.querySelector(".sk-template-field"),
       pickDir: settingsModal.querySelector(".sk-pickdir"),
       clearDir: settingsModal.querySelector(".sk-cleardir"),
       folderName: settingsModal.querySelector(".sk-folder-name"),
@@ -2026,6 +2373,8 @@
       log.info(`connections = ${getConnections()}`);
     };
     settingsEls.naming.onchange = () => { settings.naming = settingsEls.naming.value; saveStore("settings", settings); updateNamePreview(); };
+    settingsEls.aqUntil.onchange = () => { settings.aqUntil = settingsEls.aqUntil.value; saveStore("settings", settings); };
+    settingsEls.template.oninput =() => { settings.template = settingsEls.template.value; saveStore("settings", settings); updateNamePreview(); };
     settingsEls.subfolder.onchange = () => { settings.subfolder = settingsEls.subfolder.value; saveStore("settings", settings); };
     settingsEls.prefix.oninput = () => { settings.prefix = settingsEls.prefix.value; saveStore("settings", settings); updateNamePreview(); };
     settingsEls.resetSeq.onclick = () => { seqCounter = 1; saveStore("seq", 1); refreshSettingsUI(); };
@@ -2033,7 +2382,6 @@
       downloadedKeys = new Set();
       saveStore("downloaded", []);
       seenAutoQueueKeys.clear();
-      queuedViewerKeys.clear();
       refreshSettingsUI();
     };
     settingsEls.pickDir.onclick = async () => {
@@ -2043,6 +2391,7 @@
         destDirHandle = h; destDirName = h.name;
         await idbSet("destDirHandle", h);
         saveStore("destDirName", destDirName);
+        updateFolderBtn();
         refreshSettingsUI();
       } catch (e) { if (e?.name !== "AbortError") log.error("pickFolder: " + e.message); }
     };
@@ -2050,6 +2399,7 @@
       destDirHandle = null; destDirName = "";
       await idbDel("destDirHandle");
       saveStore("destDirName", "");
+      updateFolderBtn();
       refreshSettingsUI();
     };
 
@@ -2064,6 +2414,50 @@
   const supportsDirPicker = () =>
     typeof window.showDirectoryPicker === "function";
 
+  // nút chỉ có khi đã chọn thư mục lưu; trang web không mở được Explorer và không biết đường dẫn thật, nên liệt kê file ngay trong panel
+  const updateFolderBtn = () => {
+    const btn = panel?.querySelector(".sk-folder-btn");
+    if (!btn) return;
+    btn.hidden = !destDirName;
+    btn.title = t("browseFolder"); btn.setAttribute("aria-label", t("browseFolder"));
+    if (!destDirName && panel.classList.contains("files")) btn.click();
+  };
+
+  let fileListRun = 0; // bấm mở/đóng liên tục: chỉ lần đọc mới nhất được vẽ
+  const renderFileList = async () => {
+    const run = ++fileListRun;
+    const box = panel.querySelector(".sk-file-list");
+    const note = (cls, text) => {
+      const el = document.createElement("div");
+      el.className = cls; el.textContent = text;
+      box.appendChild(el);
+    };
+    box.textContent = "";
+    note("sk-file-msg", t("folderLoading"));
+    let files = null;
+    try {
+      if (await ensureDirPermission(destDirHandle)) files = await listSavedFiles(destDirHandle);
+    } catch (e) { log.error("browseFolder: " + e.message); }
+    if (run !== fileListRun || !panel.classList.contains("files")) return;
+    box.textContent = "";
+    if (!files) return note("sk-file-msg", t("folderNoAccess"));
+    if (!files.length) return note("sk-file-msg", t("folderEmpty"));
+    note("sk-file-head", t("folderFiles", { name: destDirName, n: intFmt().format(files.length) }));
+    for (const { path, file } of files.slice(0, FILE_LIST_SHOW_MAX)) {
+      // chỉ hiển thị: mở blob trong tab mới làm Chrome tải lại file nó không phát được (.mov, .mkv)
+      const row = document.createElement("div");
+      row.className = "sk-file"; row.title = `${destDirName}/${path}`;
+      const name = document.createElement("span");
+      name.className = "name"; name.dir = "auto"; name.textContent = path;
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = `${formatBytes(file.size)} · ${new Date(file.lastModified).toLocaleString(currentLang)}`;
+      row.append(name, meta);
+      box.appendChild(row);
+    }
+    if (files.length > FILE_LIST_SHOW_MAX) note("sk-file-msg", t("folderMore", { shown: FILE_LIST_SHOW_MAX }));
+  };
+
   const translateSettingsUI = () => {
     if (!settingsModal || !settingsEls.title) return;
     settingsEls.title.textContent = t("settingsTitle");
@@ -2077,6 +2471,7 @@
   };
 
   const updateNamePreview = () => {
+    if (settingsEls.templateField) settingsEls.templateField.hidden = settings.naming !== "custom";
     if (settingsEls.preview) settingsEls.preview.textContent = applyNaming("IMG_2048.jpg", true);
   };
 
@@ -2087,10 +2482,12 @@
     translateSettingsUI();
     settingsEls.lang.value = currentLang;
     settingsEls.conn.value = String(getConnections());
+    settingsEls.aqUntil.value = settings.aqUntil === "end" ? "end" : "last";
     settingsEls.naming.value = settings.naming;
     settingsEls.subfolder.value = settings.subfolder || "none";
     settingsEls.subfolder.disabled = !destDirName;
     settingsEls.prefix.value = settings.prefix || "";
+    settingsEls.template.value = settings.template || "";
     settingsEls.folderName.textContent = destDirName || t("folderNone");
     settingsEls.folderChip.classList.toggle("muted", !destDirName);
     settingsEls.pickDir.disabled = !supportsDirPicker();
@@ -2102,18 +2499,45 @@
   };
 
   const makeDraggable = (el, handle, storageKey) => {
+    // neo theo mép gần hơn ở cả 2 chiều: panel sát góc phải/dưới mở rộng hay thêm task thì mọc vào trong,
+    // không chui qua viền; --sk-room giới hạn chiều cao theo chỗ còn trống, danh sách bên trong tự cuộn
+    let placed = false;
+    const place = (l, tp) => {
+      placed = true;
+      const W = window.innerWidth, H = window.innerHeight, w = el.offsetWidth, h = el.offsetHeight;
+      l = Math.max(4, Math.min(l, W - w - 4));
+      tp = Math.max(4, Math.min(tp, H - h - 4));
+      if (l + w / 2 > W / 2) { el.style.left = "auto"; el.style.right = (W - l - w) + "px"; }
+      else { el.style.right = "auto"; el.style.left = l + "px"; }
+      if (tp + h / 2 > H / 2) {
+        const b = H - tp - h;
+        el.style.top = "auto"; el.style.bottom = b + "px";
+        el.style.setProperty("--sk-room", `${H - b - 8}px`);
+      } else {
+        el.style.bottom = "auto"; el.style.top = tp + "px";
+        el.style.setProperty("--sk-room", `${H - tp - 8}px`);
+      }
+    };
     const apply = () => {
       try {
         const pos = loadStore(storageKey, null);
         if (!pos || typeof pos.left !== "number" || typeof pos.top !== "number") return;
-        const maxL = window.innerWidth - el.offsetWidth - 4;
-        const maxT = window.innerHeight - el.offsetHeight - 4;
-        el.style.left = Math.max(4, Math.min(pos.left, maxL)) + "px";
-        el.style.top = Math.max(4, Math.min(pos.top, maxT)) + "px";
-        el.style.right = "auto"; el.style.bottom = "auto";
+        // giữ khoảng cách tới mép đã neo, kể cả khi lúc tải trang panel to/nhỏ khác lúc kéo
+        const l = pos.anchorX === "right" ? window.innerWidth - pos.right - el.offsetWidth : pos.left;
+        const tp = pos.anchorY === "bottom" ? window.innerHeight - pos.bottom - el.offsetHeight : pos.top;
+        place(l, tp);
       } catch { /* vị trí đã lưu bị hỏng: giữ vị trí mặc định */ }
     };
     requestAnimationFrame(apply);
+    window.addEventListener("resize", apply);
+    // thu gọn/mở rộng, thêm task: kích thước đổi thì kéo panel vào lại trong màn hình
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(() => {
+        if (!placed || dragging) return;
+        const r = el.getBoundingClientRect();
+        place(r.left, r.top);
+      }).observe(el);
+    }
     let dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
     handle.style.cursor = "move";
     handle.addEventListener("pointerdown", (e) => {
@@ -2122,22 +2546,21 @@
       handle.setPointerCapture(e.pointerId);
       const r = el.getBoundingClientRect();
       sl = r.left; st = r.top; sx = e.clientX; sy = e.clientY;
-      el.style.left = sl + "px"; el.style.top = st + "px";
-      el.style.right = "auto"; el.style.bottom = "auto";
+      place(sl, st);
     });
     handle.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      const l = sl + (e.clientX - sx), tp = st + (e.clientY - sy);
-      const maxL = window.innerWidth - el.offsetWidth - 4;
-      const maxT = window.innerHeight - el.offsetHeight - 4;
-      el.style.left = Math.max(4, Math.min(l, maxL)) + "px";
-      el.style.top = Math.max(4, Math.min(tp, maxT)) + "px";
+      if (dragging) place(sl + (e.clientX - sx), st + (e.clientY - sy));
     });
     const end = (e) => {
       if (!dragging) return;
       dragging = false;
       try { handle.releasePointerCapture(e.pointerId); } catch { /* pointer đã được nhả */ }
-      saveStore(storageKey, { left: parseFloat(el.style.left), top: parseFloat(el.style.top) });
+      const r = el.getBoundingClientRect();
+      saveStore(storageKey, {
+        left: r.left, top: r.top, right: window.innerWidth - r.right, bottom: window.innerHeight - r.bottom,
+        anchorX: el.style.left === "auto" ? "right" : "left",
+        anchorY: el.style.top === "auto" ? "bottom" : "top",
+      });
     };
     handle.addEventListener("pointerup", end);
     handle.addEventListener("pointercancel", end);
@@ -2146,13 +2569,16 @@
   const refreshAllLabels = () => {
     if (!panel) return;
     panel.querySelector(".sk-clear").title = t("clearHistory");
-    panel.querySelector(".sk-settings-btn").title = t("settings");
+    selectBar.querySelector(".sk-select-settings").title = t("settings");
+    updateFolderBtn();
+    if (panel.classList.contains("files")) renderFileList();
     const pToggle = panel.querySelector(".sk-toggle");
     pToggle.title = panel.classList.contains("collapsed") ? t("show") : t("hide");
     const sToggle = selectBar.querySelector(".sk-select-toggle");
     sToggle.title = selectBar.classList.contains("collapsed") ? t("show") : t("hide");
     for (const task of downloadTasks.values()) renderTask(task);
     updateSelectBar();
+    renderAqStatus();
     document.querySelectorAll("button.sk-dl-btn").forEach((b) => {
       const label = t(b.disabled ? "loadingMedia" : "download");
       b.title = label; b.setAttribute("aria-label", label);
@@ -2165,7 +2591,6 @@
 
   // Viewer WebA là <dialog>.showModal() (top layer): vẽ trên mọi z-index và làm phần còn lại inert, nên panel phải nằm trong dialog
   const keepPanelsOnTop = () => {
-    if (TEST_MODE) return;
     let host = document.body;
     const dlg = document.getElementById("MediaViewer");
     if (dlg && dlg.open) host = dlg;
@@ -2230,7 +2655,7 @@
     const media = mover.querySelector(":scope > .media-viewer-aspecter") || mover;
     const videoEl = media.querySelector("video");
     const videoUrl = getMediaSource(videoEl);
-    if (videoUrl) return { url: videoUrl, kind: "video" };
+    if (videoUrl) return { url: videoUrl, kind: "video", el: videoEl };
     if (videoEl || media.querySelector(VIDEO_CONTEXT_SELECTOR)) return null;
     const imgUrl = getMediaSource(media.querySelector("img.thumbnail"));
     if (imgUrl) return { url: imgUrl, kind: "image" };
@@ -2251,56 +2676,62 @@
     return null;
   };
 
+  const blobReadable = (url) =>
+    ownFetch(url).then((res) => { res.body?.cancel().catch(() => {}); return true; }, () => false);
+
+  // video WebK có nguồn blob: không phải Blob (MediaSource của hls.js) thì tải lại qua HLS;
+  // phải gọi khi slide còn mở (cần video.duration để nhận đúng playlist). Không chờ tải xong.
+  // Không dò blob: bằng fetch trừ khi bắt buộc: request lỗi nào trình duyệt cũng in đỏ ra Console
+  const downloadViewerMedia = async (r, opts) => {
+    if (isWebK && r.kind === "video" && r.url.startsWith("blob:") && !(BlobRegistry.get(r.url) instanceof Blob)) {
+      const isMs = BlobRegistry.isMediaSource(r.url);
+      // chưa chắc là HLS thì playlist phải khớp thời lượng mới nhận
+      const master = r.el ? await findHlsMaster(r.el, !isMs) : null;
+      if (master) {
+        // media key tính từ master (file:<id>) để chống trùng đúng file, không theo blob: tạm thời
+        const { mediaKey: _mk, ...rest } = opts;
+        downloadMedia(master, "video", rest);
+        return true;
+      }
+      if (isMs || !(await blobReadable(r.url))) {
+        log.warn("HLS: không tìm được playlist của video này");
+        flashDlButton(t("hlsNotFound"));
+        return false;
+      }
+    }
+    downloadMedia(r.url, r.kind, opts);
+    return true;
+  };
+
   const downloadCurrentWebKMedia = () => {
-    const viewer = document.querySelector(".media-viewer-whole");
-    if (!viewer) return;
-    const buttons = viewer.querySelector(".media-viewer-topbar .media-viewer-buttons");
-    const native = buttons && getWebKDlButtons(buttons).find(
-      (b) => isUsableBtn(b) && !b.matches(
-        '.quality-download-options-button-menu, .btn-menu-toggle, [aria-haspopup="menu"], [aria-haspopup="true"]'
-      )
-    );
-    if (native) { native.click(); return; }
     const r = resolveViewerWebKMedia();
-    if (r) downloadMedia(r.url, r.kind);
+    if (r) downloadViewerMedia(r, {});
   };
 
-  const queuedViewerKeys = new Set();
-  const queueCurrentWebKMedia = () => {
-    const r = resolveViewerWebKMedia();
+  // downloadMedia đã gộp task đang chạy; skipDownloaded bỏ qua file đã tải, còn file lỗi/đã hủy thì xếp hàng lại được
+  const queueViewerMedia = () => {
+    const r = isWebA ? resolveViewerWebAMedia() : resolveViewerWebKMedia();
     if (!r) return;
-    const mk = mediaKey(r.url);
-    if (queuedViewerKeys.has(mk)) return;
-    queuedViewerKeys.add(mk);
-    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
+    downloadViewerMedia(r, { batch: true, silent: true, skipDownloaded: true });
     log.info(`queued: ${r.kind}`);
   };
 
-  const queueCurrentWebAMedia = () => {
-    const r = resolveViewerWebAMedia();
-    if (!r) return;
-    const mk = mediaKey(r.url);
-    if (queuedViewerKeys.has(mk)) return;
-    queuedViewerKeys.add(mk);
-    downloadMedia(r.url, r.kind, { batch: true, silent: true, mediaKey: mk });
-    log.info(`queued: ${r.kind}`);
-  };
-
-  // dùng class nút gốc của WebA để hợp giao diện viewer
-  const makeWebAQueueButton = () => {
-    const b = document.createElement("button");
-    b.className = "Button smaller translucent-white round sk-queue-btn";
-    b.type = "button";
-    b.title = t("topbarQueue");
-    b.setAttribute("aria-label", t("topbarQueue"));
-    b.innerHTML = `<span class="sk-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
-    b.onclick = (e) => {
+  const WEBA_BTN_CLASS = "Button smaller translucent-white round";
+  // className lấy class nút gốc của từng app để hợp giao diện viewer
+  const makeQueueButton = (className) => {
+    const btn = document.createElement("button");
+    btn.className = `${className} sk-queue-btn`;
+    btn.type = "button";
+    btn.title = t("topbarQueue");
+    btn.setAttribute("aria-label", t("topbarQueue"));
+    btn.innerHTML = `<span class="sk-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
+    btn.onclick = (e) => {
       e.stopPropagation();
-      queueCurrentWebAMedia();
-      b.classList.add("queued");
-      setTimeout(() => b.classList.remove("queued"), 1200);
+      queueViewerMedia();
+      btn.classList.add("queued");
+      setTimeout(() => btn.classList.remove("queued"), 1200);
     };
-    return b;
+    return btn;
   };
 
   const WEBK_NEXT_SELECTORS = ".media-viewer-switcher.media-viewer-switcher-next, .media-viewer-switcher-next";
@@ -2413,7 +2844,7 @@
   const selectedBubbles = new Set();
   const selectedItems = new Map();
   let selectMode = false;
-  let autoQueueMode = TEST_MODE ? false : loadStore("autoQueue", false);
+  let autoQueueMode = loadStore("autoQueue", false);
   let lastClickedBubble = null;
   const seenAutoQueueKeys = new Set();
 
@@ -2616,21 +3047,40 @@
     return !(badge && /^gif/i.test(badge.textContent.trim()));
   };
 
-  const armPostFromClick = (e) => {
-    if (!autoQueueMode || selectMode) return;
-    const item = e.target.closest?.(POST_ITEM_SELECTOR);
-    const bubble = item?.closest(".bubble, .Message");
-    if (!item || !bubble || item.closest(EXCLUDED_SCOPES)) return;
+  // số video từ media `item` trở xuống trong phần chat đã tải; null nếu item đã bị gỡ khỏi DOM
+  const countVideosAhead = (item) => {
+    const bubble = item?.isConnected ? item.closest(".bubble, .Message") : null;
+    if (!bubble || item.closest(EXCLUDED_SCOPES)) return null;
     const list = bubble.closest(".bubbles-inner, .bubbles, .MessageList");
     const all = (list ? Array.from(list.querySelectorAll(BUBBLE_SELECTORS)) : [bubble]).flatMap(postMediaItems);
     const start = all.findIndex((el) => el === item || el.contains(item) || item.contains(el));
-    if (start < 0) return;
-    const ahead = all.slice(start);
+    return start < 0 ? null : all.slice(start).filter(isViewerVideo).length;
+  };
+
+  const armPostFromClick = (e) => {
+    if (!autoQueueMode || selectMode) return;
+    const item = e.target.closest?.(POST_ITEM_SELECTOR);
+    const videoCount = countVideosAhead(item);
+    if (videoCount == null) return;
     aqPlan = {
-      videoCount: ahead.filter(isViewerVideo).length, videosSeen: 0,
+      startEl: item, videoCount, videosSeen: 0,
       lastSlide: null, lastUrl: null, pendingEl: null, pendingSince: 0, advanceAt: 0, endRetries: 0,
     };
-    log.info(`auto-queue: còn ${aqPlan.videoCount} video phía trước (${ahead.length} media)`);
+    log.info(`auto-queue: còn ${videoCount} video phía trước`);
+    renderAqStatus();
+  };
+
+  // dòng trạng thái trong panel Chọn hàng loạt; "đã qua" gồm cả video đã tải trước đó (bị bỏ qua)
+  const renderAqStatus = () => {
+    const el = selectBar?.querySelector(".sk-aq-status");
+    if (!el) return;
+    const plan = autoQueueMode ? aqPlan : null;
+    el.hidden = !plan;
+    if (!plan) return;
+    const left = plan.videoCount - plan.videosSeen;
+    el.textContent = left > 0
+      ? t("aqStatus", { left, seen: plan.videosSeen })
+      : t("aqStatusSearching", { seen: plan.videosSeen });
   };
 
   const viewerOpen = () => {
@@ -2647,16 +3097,15 @@
     const mk = mediaKey(r.url);
     if (seenAutoQueueKeys.has(mk)) return;
     seenAutoQueueKeys.add(mk);
-    if (downloadedKeys.has(mk)) { log.info("auto-queue: đã tải rồi, bỏ qua"); return; }
-    queuedViewerKeys.add(mk);
-    downloadMedia(r.url, "video", { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
     log.info("auto-queue: video");
+    return downloadViewerMedia(r, { batch: true, silent: true, mediaKey: mk, skipDownloaded: true });
   };
 
   const finishPlan = (plan, msg) => {
     if (aqPlan !== plan) return;
     aqPlan = null;
     log.info(msg);
+    renderAqStatus();
     flashDlButton(t("postVideosDone", { n: plan.videosSeen }));
   };
 
@@ -2666,10 +3115,14 @@
     if (res === true) { plan.advanceAt = Date.now(); plan.endRetries = 0; return; }
     if (res === null) { setTimeout(() => requestAdvance(plan), 300); return; } // lần chuyển trước chưa xong
     if (++plan.endRetries <= AQ_END_RETRIES) { setTimeout(() => requestAdvance(plan), 500); return; }
-    finishPlan(plan, `auto-queue: hết slide, ${plan.videoCount - plan.videosSeen} video không tới được`);
+    const missed = plan.videoCount - plan.videosSeen;
+    finishPlan(plan, missed > 0
+      ? `auto-queue: hết slide, ${missed} video không tới được`
+      : `auto-queue: hết slide, ${plan.videosSeen} video`);
   };
 
-  const processAutoQueue = () => {
+  const processAutoQueue = () => { stepAutoQueue(); renderAqStatus(); };
+  const stepAutoQueue = () => {
     if (!autoQueueMode) return;
     if (!viewerOpen()) { aqPlan = null; return; }
     const r = isWebA ? resolveViewerWebAMedia() : resolveViewerWebKMedia();
@@ -2686,6 +3139,7 @@
       if (plan.advanceAt && Date.now() - plan.advanceAt > AQ_STUCK_MS) requestAdvance(plan);
       return;
     }
+    let queued = null;
     if (!r) {
       if (plan.pendingEl !== el) { plan.pendingEl = el; plan.pendingSince = Date.now(); return; }
       if (Date.now() - plan.pendingSince < AQ_PENDING_TIMEOUT_MS) return;
@@ -2695,31 +3149,24 @@
       }
     } else if (r.kind === "video") {
       plan.videosSeen++;
-      queueAutoVideo(r);
+      queued = queueAutoVideo(r);
     }
     plan.lastSlide = el; plan.lastUrl = r?.url ?? null; plan.pendingEl = null;
-    if (plan.videosSeen >= plan.videoCount) {
-      finishPlan(plan, `auto-queue: xong, ${plan.videosSeen}/${plan.videoCount} video`);
-      return;
+    // chế độ "hết slide": cứ đi tới khi requestAdvance hết nút next
+    if (plan.videosSeen >= plan.videoCount && settings.aqUntil !== "end") {
+      // chat có thể đã tải thêm tin bên dưới từ lúc click: đếm lại trước khi dừng
+      const n = countVideosAhead(plan.startEl);
+      if (n != null && n > plan.videoCount) {
+        log.info(`auto-queue: chat có thêm video, ${plan.videoCount} → ${n}`);
+        plan.videoCount = n;
+      } else {
+        finishPlan(plan, `auto-queue: xong, ${plan.videosSeen}/${plan.videoCount} video`);
+        return;
+      }
     }
     plan.advanceAt = 0;
-    setTimeout(() => requestAdvance(plan), 400);
-  };
-
-  const makeQueueButton = (extraClass) => {
-    const btn = document.createElement("button");
-    btn.className = `btn-icon sk-queue-btn${extraClass ? " " + extraClass : ""}`;
-    btn.type = "button";
-    btn.title = t("topbarQueue");
-    btn.setAttribute("aria-label", t("topbarQueue"));
-    btn.innerHTML = `<span class="sk-queue-icon" aria-hidden="true">${QUEUE_ICON_SVG}</span>`;
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      queueCurrentWebKMedia();
-      btn.classList.add("queued");
-      setTimeout(() => btn.classList.remove("queued"), 1200);
-    };
-    return btn;
+    // đợi xử lý xong slide này (nhờ Telegram tải cần slide còn mở) rồi mới chuyển
+    Promise.resolve(queued).catch(() => {}).finally(() => setTimeout(() => requestAdvance(plan), 400));
   };
 
   const refreshWebK = () => {
@@ -2802,17 +3249,17 @@
       if (controls && !controls.querySelector(".sk-dl-btn")) {
         const right = controls.querySelector(".bottom-controls .right-controls");
         right?.prepend(makeViewerDlBtn("default__button tgico-download"));
-        if (!controls.querySelector(".sk-queue-btn")) right?.prepend(makeQueueButton("default__button"));
+        if (!controls.querySelector(".sk-queue-btn")) right?.prepend(makeQueueButton("btn-icon default__button"));
       }
     } else if (asp.querySelector("video") && !hasDl) {
       buttons.prepend(makeViewerDlBtn("tgico-download"));
-      if (!buttons.querySelector(".sk-queue-btn")) buttons.prepend(makeQueueButton());
+      if (!buttons.querySelector(".sk-queue-btn")) buttons.prepend(makeQueueButton("btn-icon"));
     } else if (!hasDl) {
       const thumb = asp.querySelector("img.thumbnail");
       if (thumb?.src) buttons.prepend(makeViewerDlBtn("tgico-download"));
     }
     if (resolveViewerWebKMedia() && !buttons.querySelector(".sk-queue-btn")) {
-      buttons.prepend(makeQueueButton());
+      buttons.prepend(makeQueueButton("btn-icon"));
     }
   };
 
@@ -2874,14 +3321,14 @@
       } else if (!actions.querySelector("button.sk-dl-btn")) {
         actions.prepend(makeBtn());
       }
-      if (!actions.querySelector("button.sk-queue-btn")) actions.prepend(makeWebAQueueButton());
+      if (!actions.querySelector("button.sk-queue-btn")) actions.prepend(makeQueueButton(WEBA_BTN_CLASS));
     }
     const controls = media.querySelector(".VideoPlayerControls .buttons");
     if (controls) {
       const sp = controls.querySelector(".spacer");
       const place = (b) => (sp ? sp.after(b) : controls.appendChild(b));
       if (!controls.querySelector("button.sk-dl-btn")) place(makeBtn());
-      if (!controls.querySelector("button.sk-queue-btn")) place(makeWebAQueueButton());
+      if (!controls.querySelector("button.sk-queue-btn")) place(makeQueueButton(WEBA_BTN_CLASS));
     }
   };
 
@@ -2892,6 +3339,7 @@
   const refreshApp = isWebK ? refreshWebK : isWebA ? refreshWebA : null;
 
   const boot = () => {
+    if (isWebK) watchHlsRequests();
     buildUI();
     refreshAllLabels();
 
@@ -2913,6 +3361,8 @@
       autoQueueMode = !autoQueueMode;
       saveStore("autoQueue", autoQueueMode);
       if (autoQueueMode) { seenAutoQueueKeys.clear(); log.info("auto-queue on"); }
+      aqPlan = null;
+      renderAqStatus();
       updateSelectBar();
     };
     selClearBtn.onclick = clearSelection;
@@ -2995,29 +3445,6 @@
 
     log.info(`SakerLy Telegram Media Downloader v${SCRIPT_VERSION} loaded — parallel engine ×${getConnections()} (${currentLang.toUpperCase()}, ${isWebK ? "WebK" : isWebA ? "WebA" : "?"})`);
   };
-
-  if (TEST_MODE) {
-    Object.assign(globalThis.__SK_TEST__, {
-      RangeLedger, SpeedMeter, NetBudget, MemWriter, FsWriter, BlobRegistry,
-      backoffDelay, formatBytes, formatDuration, t, LANGS,
-      getConnections, setSettings: (s) => Object.assign(settings, s),
-      __internal: {
-        CHUNK_GRID, CHUNK_DEFAULT, CHUNK_MAX, CHUNK_MIN, CHUNK_RETRIES,
-        buildEngine: () => ({ engineDownload, fetchChunk, parallelRangeDownload, downloadFromBlob, concatU8 }),
-        makeTask: (url, kind = "video") => ({
-          id: "test-" + Math.random().toString(36).slice(2),
-          key: "test:" + url, url, kind, mediaKey: "test",
-          fileName: "test.bin", state: "preparing", received: 0, total: null,
-          speed: 0, eta: null, inflight: 0,
-          controller: new AbortController(), meter: new SpeedMeter(),
-          startedAt: performance.now(), finished: false,
-          pauseFlag: false, cancelRequested: false,
-          writer: new MemWriter(), onProgress: () => {},
-        }),
-      },
-    });
-    return;
-  }
 
   boot();
 })();

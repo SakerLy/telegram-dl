@@ -5,7 +5,7 @@
 Tải ảnh, video, GIF và voice từ **Telegram Web**, kể cả kênh chặn lưu nội dung.<br>
 Download photos, videos, GIFs and voice messages from **Telegram Web**, including channels that restrict saving.
 
-[![Version](https://img.shields.io/badge/version-2.2.1-1a72bd)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.2-1a72bd)](CHANGELOG.md)
 [![WebK](https://img.shields.io/badge/Telegram-WebK-2aabee)](https://web.telegram.org/k/)
 [![WebA](https://img.shields.io/badge/Telegram-WebA-2aabee)](https://web.telegram.org/a/)
 [![Userscript](https://img.shields.io/badge/userscript-Tampermonkey%20%7C%20Violentmonkey-00485b)](#cài-đặt)
@@ -66,16 +66,19 @@ Download photos, videos, GIFs and voice messages from **Telegram Web**, includin
 
 ### Cài đặt nâng cao
 
-Bấm biểu tượng bánh răng trên một trong hai panel.
+Bấm biểu tượng bánh răng trên panel *Chọn hàng loạt*.
 
 | Nhóm | Mục | Mô tả |
 |---|---|---|
 | Chung | Ngôn ngữ | Tiếng Việt hoặc English |
 | | Số luồng tải mỗi file | 1–4, mặc định 3 |
-| Tên file | Định dạng | Tên gốc, ngày giờ, số thứ tự hoặc kết hợp; có dòng xem trước |
+| | Auto-queue dừng khi | Sau video cuối đã đếm (mặc định) hoặc hết slide |
+| Tên file | Định dạng | Tên gốc, ngày giờ, số thứ tự, kết hợp, hoặc **Tuỳ chỉnh**; có dòng xem trước |
+| | Mẫu tên file | Khi chọn Tuỳ chỉnh: ghép `{name}` `{date}` `{time}` `{seq}` `{channel}`, VD `{channel}_{date}_{name}` |
 | | Tiền tố | Chuỗi thêm vào đầu tên file |
 | Nơi lưu | Thư mục lưu | Lưu vào thư mục riêng thay cho Downloads |
 | | Thư mục con | Theo ngày, theo kênh hoặc cả hai; cần chọn thư mục lưu trước |
+| | Xem file | Nút thư mục trên panel *Tải xuống* liệt kê file trong thư mục lưu, mới nhất ở trên |
 | Dữ liệu | Số thứ tự | Số kế tiếp, có nút đặt lại |
 | | Media đã tải | Số media đã nhớ, có nút **Quên hết** |
 
@@ -154,16 +157,19 @@ Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampe
 
 ### Settings
 
-Click the gear icon on either panel.
+Click the gear icon on the *Batch select* panel.
 
 | Group | Option | Description |
 |---|---|---|
 | General | Language | Tiếng Việt or English |
 | | Connections per file | 1–4, default 3 |
-| File name | Format | Original name, date-time, sequence number or a combination, with a live preview |
+| | Auto-queue stops | After the last counted video (default) or at the last slide |
+| File name | Format | Original name, date-time, sequence number, a combination, or **Custom**, with a live preview |
+| | Name template | With Custom: combine `{name}` `{date}` `{time}` `{seq}` `{channel}`, e.g. `{channel}_{date}_{name}` |
 | | Prefix | Text prepended to every file name |
 | Saving | Destination folder | Save into a folder of your choice instead of Downloads |
 | | Subfolders | By date, by channel or both; needs a destination folder |
+| | Browse files | The folder button on the *Downloads* panel lists the files in the destination folder, newest first |
 | Data | Sequence | Next number, with a reset button |
 | | Downloaded media | How many media are remembered, with a **Forget all** button |
 

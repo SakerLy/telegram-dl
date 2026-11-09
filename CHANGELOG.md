@@ -3,10 +3,31 @@
 Mọi thay đổi đáng chú ý của Telegram Media Downloader được ghi lại ở đây.
 Định dạng theo [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/), phiên bản theo [Semantic Versioning](https://semver.org/lang/vi/).
 
-## Chưa phát hành
+## 2.2.2
 
 ### Thêm
 - Phát hành theo giấy phép **GPL-3.0-or-later** (file [LICENSE](LICENSE), khai báo `@license` trong header của script).
+- **Mẫu tên file tuỳ chỉnh**: chọn *Tuỳ chỉnh* trong Cài đặt → Tên file rồi ghép `{name}`, `{date}`, `{time}`, `{seq}`, `{channel}` theo ý muốn.
+- **Xem file đã tải**: nút thư mục trên panel *Tải xuống* liệt kê file trong thư mục lưu (kể cả thư mục con), mới nhất ở trên, để biết file đã lưu ở đâu. Trình duyệt không cho trang web mở Explorer nên danh sách hiện ngay trong panel.
+- **Auto-queue báo số video còn lại**: panel *Chọn hàng loạt* hiện "Còn N video phía trước". Cài đặt mới *Auto-queue dừng khi*: sau video cuối đã đếm (mặc định; đếm lại nếu chat đã tải thêm video) hoặc hết slide.
+
+### Thay đổi
+- Bỏ nút Cài đặt trên panel *Tải xuống*; mở Cài đặt từ panel *Chọn hàng loạt*.
+
+### Sửa lỗi
+- Không tải được video có tuỳ chọn độ phân giải trên WebK (báo nhầm "Telegram đã giải phóng media này"). WebK phát loại video này qua HLS nên nguồn là MediaSource, không đọc được dữ liệu. Giờ script tìm đúng playlist HLS của video (khớp theo thời lượng) rồi ưu tiên tải **file gốc** qua `stream/`; nếu Telegram không cho (vd file `.mov`) thì ghép các đoạn HLS thành một file mp4, chọn bản **H.264** cao nhất (HEVC/AV1 nhiều trình phát không mở được). Lưu vào thư mục lưu, đặt tên theo mẫu, có tiến trình, Tạm dừng/Tiếp tục và Thử lại như file thường.
+- Panel *Tải xuống* sau khi kéo đi chỗ khác bị tràn khỏi đáy màn hình khi thêm task, che mất tiến trình. Giờ panel neo theo mép gần hơn và không cao quá chỗ còn trống.
+- Panel thu gọn rồi kéo sát góc, khi mở rộng lại bị chui qua viền màn hình. Giờ cả hai panel neo theo mép trái/phải và trên/dưới gần hơn, và tự kéo vào trong mỗi khi đổi kích thước.
+- Khi tải bằng nhiều luồng vào thư mục lưu, các luồng cùng tạo file một lúc nên ra nhiều file (`x.mp4`, `x (1).mp4`…): các file thừa 0 byte, file còn lại đủ dung lượng nhưng thiếu đoạn nên không xem được (gặp nhiều nhất với HLS). Giờ chỉ tạo đúng một file.
+- Media đã tải trước đó bị bỏ qua mà không báo gì; giờ panel *Tải xuống* hiện thẻ "Đã tải trước đó, bỏ qua".
+- Console không còn hiện lỗi `blob: … ERR_FILE_NOT_FOUND` mỗi khi tải video HLS (do script dò nguồn video).
+- Bấm **×** trên task đang tải chỉ ẩn card: task vẫn tải tiếp, tự thử lại và card hiện lại. Giờ × trên task chưa xong sẽ hủy hẳn.
+- Auto-queue trên WebK: video có nguồn `blob:` xếp hàng sau file lớn bị lỗi `ERR_FILE_NOT_FOUND` vì tới lượt thì Telegram đã giải phóng media. Giờ script đọc lấy dữ liệu ngay lúc xếp hàng, khi media còn trên màn hình (kể cả blob do worker của Telegram tạo); nếu media đã mất thật thì báo lỗi rõ ràng ngay thay vì thử lại vô ích.
+- Hủy rồi bấm **Thử lại** tạo ra file hỏng (thiếu phần đầu) mà vẫn báo Hoàn tất.
+- Hai file trùng tên tải cùng lúc vào thư mục lưu ghi đè lên nhau, mất một file.
+- Khi chuyển sang trình duyệt tự tải sau lỗi (WebA), file dở dang còn nằm lại trong thư mục lưu và tên file bị thêm tiền tố / số thứ tự hai lần.
+- Bấm Tạm dừng rồi Tiếp tục quá nhanh có thể làm task thất bại.
+- Nút **Thêm vào hàng chờ** không xếp hàng lại được video đã lỗi hoặc đã hủy cho tới khi tải lại trang.
 
 ## 2.2.1
 
