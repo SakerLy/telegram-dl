@@ -38,10 +38,21 @@ chrome.storage.onChanged.addListener((changes, area) => {
   toPage(values);
 });
 
-window.addEventListener("message", (e) => {
+// Tải lại/cập nhật extension mà chưa tải lại tab: bridge cũ còn trong tab nhưng mọi lệnh chrome.* ném
+// "Extension context invalidated". Khi đó gỡ listener và im lặng; tải lại tab sẽ có bridge mới.
+const alive = () => { try { return !!chrome.runtime?.id; } catch { return false; } };
+
+const onPageMessage = (e) => {
   if (e.source !== window || e.data?.source !== "tgdl-page") return;
-  if (e.data.type === "store" && KEYS.includes(e.data.key)) chrome.storage.local.set({ [e.data.key]: e.data.value });
-  // mở trang Options trong tab mới (options.html khai báo web_accessible_resources cho các domain Telegram);
-  // không cần background: MV3 của Chrome chỉ nhận service_worker, Firefox lại cần background.scripts
-  else if (e.data.type === "openOptions") window.open(chrome.runtime.getURL("options.html"), "_blank");
-});
+  if (!alive()) { window.removeEventListener("message", onPageMessage); return; }
+  try {
+    if (e.data.type === "store" && KEYS.includes(e.data.key)) {
+      chrome.storage.local.set({ [e.data.key]: e.data.value }).catch(() => {});
+    } else if (e.data.type === "openOptions") {
+      // options.html khai báo web_accessible_resources cho các domain Telegram; không cần background:
+      // MV3 của Chrome chỉ nhận service_worker, Firefox lại cần background.scripts
+      window.open(chrome.runtime.getURL("options.html"), "_blank");
+    }
+  } catch { window.removeEventListener("message", onPageMessage); }
+};
+window.addEventListener("message", onPageMessage);
