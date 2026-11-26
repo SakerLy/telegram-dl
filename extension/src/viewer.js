@@ -96,7 +96,7 @@ const downloadViewerMedia = async (r, opts) => {
     }
     if (isMs || !(await blobReadable(r.url))) {
       log.warn("HLS: không tìm được playlist của video này");
-      flashDlButton(t("hlsNotFound"));
+      notify(t("hlsNotFound"));
       return false;
     }
   }

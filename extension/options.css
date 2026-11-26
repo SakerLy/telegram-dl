@@ -1,20 +1,20 @@
 :root {
-  --bg: #f3f5f8; --card: #ffffff; --fg: #0f1720; --muted: #5b6878; --line: #e2e7ee;
-  --accent: #2a9df4; --accent-fg: #ffffff; --accent-soft: #e5f2fe; --danger: #d92d20; --danger-soft: #fdecea;
+  --bg: #f4f4f5; --card: #ffffff; --fg: #0f0f0f; --muted: #707579; --line: #e7e8ea;
+  --accent: #3390ec; --accent-fg: #ffffff; --accent-soft: #e4f0fd; --danger: #d92d20; --danger-soft: #fdecea;
   --radius: 14px;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1419; --card: #1a222c; --fg: #eef2f6; --muted: #9aa8b8; --line: #2a3542;
-    --accent: #4aa8f7; --accent-fg: #06121f; --accent-soft: #15324d; --danger: #ff6b6b; --danger-soft: #3a1d1d;
+    --bg: #0f0f0f; --card: #212121; --fg: #ffffff; --muted: #aaaaaa; --line: #2f2f2f;
+    --accent: #8774e1; --accent-fg: #ffffff; --accent-soft: #2b2640; --danger: #ff6b6b; --danger-soft: #3a1d1d;
     color-scheme: dark;
   }
 }
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--bg); color: var(--fg);
-  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 14px/1.5 Roboto, -apple-system, "Segoe UI", system-ui, sans-serif;
 }
 
 .top {
@@ -30,7 +30,7 @@ body {
 .top p { margin: 2px 0 0; color: var(--muted); }
 
 main { max-width: 760px; margin: 0 auto; padding: 8px 20px 48px; display: grid; gap: 16px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 20px; }
+.card { background: var(--card); border-radius: 16px; padding: 6px 20px; box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
 .card h2 {
   margin: 14px 0 4px; font-size: 12px; font-weight: 800; letter-spacing: .08em;
   text-transform: uppercase; color: var(--accent);
@@ -55,12 +55,12 @@ select:focus, input[type="text"]:focus, .btn:focus-visible, .seg button:focus-vi
 }
 select:disabled { opacity: .5; }
 
-.seg { display: inline-flex; padding: 3px; gap: 3px; border-radius: 11px; background: var(--bg); border: 1px solid var(--line); flex-shrink: 0; }
+.seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 12px; background: var(--bg); flex-shrink: 0; }
 .seg button {
   border: 0; background: transparent; color: var(--fg); font: inherit; font-weight: 600;
   min-width: 40px; height: 32px; padding: 0 12px; border-radius: 8px; cursor: pointer;
 }
-.seg button.on { background: var(--accent); color: var(--accent-fg); }
+.seg button.on { background: var(--card); color: var(--fg); box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
 
 .btn {
   height: 36px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--line);

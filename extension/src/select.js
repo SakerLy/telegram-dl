@@ -175,21 +175,24 @@ const isMeaningfullyVisible = (el) => {
   return (ix * iy) / (r.width * r.height) >= 0.5;
 };
 
+const setSwitch = (btn, label, on) => {
+  btn.querySelector(".lbl").textContent = label;
+  btn.classList.toggle("on", on);
+  btn.setAttribute("aria-checked", String(on));
+};
+
 const updateSelectBar = () => {
   if (!selectBar) return;
   // giữ vị trí cuộn khi vẽ lại list
-  const bodyEl = selectBar.querySelector(".sk-select-body");
+  const bodyEl = selectBar.querySelector(".sk-scroll");
   const stick = bodyEl ? bodyEl.scrollTop : 0;
   const count = totalSelectedItems();
-  selCount.textContent = String(count);
-  selCount.dataset.zero = count === 0 ? "1" : "";
-  selTitle.textContent = t("selectTitle");
+  selCount.textContent = count ? intFmt().format(count) : "";
+  selTitle.textContent = t("tabSelect");
   selHint.innerHTML =
     `<div>${t("hintPhoto")}</div><div>${t("hintVideo")}</div><div class="keys">${t("hintKeys")}</div>`;
-  selModeBtn.textContent = t("selectMode");
-  selModeBtn.classList.toggle("on", selectMode);
-  selAutoBtn.textContent = t("autoQueue");
-  selAutoBtn.classList.toggle("on", autoQueueMode);
+  setSwitch(selModeBtn, t("selectMode"), selectMode);
+  setSwitch(selAutoBtn, t("autoQueue"), autoQueueMode);
   selAllBtn.textContent = t("selectAll");
   selClearBtn.textContent = t("clearSelection");
   selDlBtn.innerHTML =
@@ -233,8 +236,3 @@ const updateSelectBar = () => {
   if (bodyEl) bodyEl.scrollTop = stick;
 };
 
-const flashDlButton = (text) => {
-  selDlBtn.textContent = text;
-  clearTimeout(flashDlButton.timer);
-  flashDlButton.timer = setTimeout(updateSelectBar, 2500);
-};

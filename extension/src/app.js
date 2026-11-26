@@ -253,7 +253,7 @@ const boot = () => {
     }
     log.info(`batch: queued ${queued}, skipped ${skipped} already downloaded`);
     clearSelection();
-    if (skipped) flashDlButton(t("skippedDownloaded", { n: skipped }));
+    if (skipped) notify(t("skippedDownloaded", { n: skipped }));
   };
 
   window.addEventListener("keydown", (e) => {
@@ -276,7 +276,7 @@ const boot = () => {
     const observer = new MutationObserver((records) => {
       if (records.some((r) => {
         const target = r.target instanceof Element ? r.target : r.target.parentElement;
-        if (target?.closest("#sk-panel, #sk-select, .sk-dl-btn, .sk-pinned-dl, .sk-queue-btn")) return false;
+        if (target?.closest("#sk-fab, #sk-dock, #sk-toast, .sk-dl-btn, .sk-pinned-dl, .sk-queue-btn")) return false;
         if (target?.closest(roots) || Array.from(r.addedNodes).some((n) =>
           n instanceof Element && (n.matches(roots) || n.querySelector(roots))
         )) return true;

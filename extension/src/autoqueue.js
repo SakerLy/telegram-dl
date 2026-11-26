@@ -89,7 +89,7 @@ const finishPlan = (plan, msg) => {
   aqPlan = null;
   log.info(msg);
   renderAqStatus();
-  flashDlButton(t("postVideosDone", { n: plan.videosSeen }));
+  notify(t("postVideosDone", { n: plan.videosSeen }));
 };
 
 const requestAdvance = (plan) => {
