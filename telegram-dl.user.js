@@ -1298,6 +1298,20 @@
       return u.href;
     } catch { return null; }
   };
+  // telegram-tt 11/2026 (#7566): SW chỉ phục vụ download/ có token HMAC do chính nó ký, thiếu thì 403.
+  // Xin ký như mediaLoader.signDownloadUrl: {type: "signDownload", url} qua MessageChannel, trả lại URL có token.
+  // SW bản cũ không trả lời: hết giờ thì dùng URL chưa ký (bản cũ không đòi token); SW từ chối thì trả null.
+  const signWebaDownloadUrl = (url) => new Promise((resolve) => {
+    const sw = navigator.serviceWorker?.controller;
+    if (!sw) { resolve(url); return; }
+    const { port1, port2 } = new MessageChannel();
+    const timer = setTimeout(() => { port1.close(); resolve(url); }, 3000);
+    port1.onmessage = (e) => {
+      clearTimeout(timer); port1.close();
+      resolve(typeof e.data === "string" ? e.data : null);
+    };
+    sw.postMessage({ type: "signDownload", url }, [port2]);
+  });
 
   // chỉ tạo file thật khi chunk đầu về, lúc đã biết mime và tên
   class LazyWriter {
@@ -1442,7 +1456,9 @@
         log.warn("handing off to native download endpoint (large file, no FS Access)", task.fileName);
         task.usedNativeFallback = true;
         try {
-          await saveMediaBlob(null, nameOnce(task), err.handoffUrl);
+          const signed = await signWebaDownloadUrl(err.handoffUrl);
+          if (!signed) throw new Error("service worker refused to sign download URL");
+          await saveMediaBlob(null, nameOnce(task), signed);
           finishTask(task, "handedOff");
           return;
         } catch (e) { log.error("native handoff failed: " + e.message); }
@@ -1468,8 +1484,11 @@
         return;
       }
       // kiểm tra URL trước rồi mới đặt tên, để lỗi không có đường dự phòng không tiêu số thứ tự
-      const fb = !task.usedNativeFallback && webaDownloadFallback(task.url)
+      const fbRaw = !task.usedNativeFallback && webaDownloadFallback(task.url)
         ? webaDownloadFallback(task.url, nameOnce(task)) : null;
+      // ký trước khi bỏ phần đã tải: SW không ký thì giữ phần đã tải để Thử lại tiếp tục
+      const fb = fbRaw ? await signWebaDownloadUrl(fbRaw) : null;
+      if (fbRaw && !fb) log.warn("service worker refused to sign download URL", task.fileName);
       if (fb) {
         task.usedNativeFallback = true;
         log.warn("falling back to native download endpoint", task.fileName);
