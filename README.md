@@ -27,6 +27,7 @@ Download photos, videos, GIFs and voice messages from **Telegram Web**, includin
 - **Engine tải song song**: 1–4 luồng mỗi file, tự thử lại khi lỗi, tiếp tục từ chỗ dừng, Tạm dừng / Tiếp tục, hiển thị tốc độ và thời gian còn lại.
 - **Chống trùng**: nhớ media đã tải để không tải lại, không bao giờ ghi đè file có sẵn.
 - **Tên file và nơi lưu**: tên gốc, ngày giờ hoặc số thứ tự kèm tiền tố; lưu vào thư mục riêng với thư mục con theo ngày hoặc theo kênh.
+- **Copy chữ ở kênh chặn lưu**: bôi đen và Ctrl+C được chữ trong tin nhắn của kênh bật "Hạn chế lưu nội dung".
 - Giao diện tiếng Việt và tiếng Anh, theme sáng và tối, tự cập nhật bản mới.
 
 ### Hỗ trợ
@@ -118,6 +119,7 @@ Script tự kiểm tra bản mới mỗi 24 giờ. Muốn kiểm tra ngay: Tampe
 - **Parallel engine**: 1–4 connections per file, automatic retries, resume after failure, Pause / Resume, live speed and time left.
 - **Duplicate protection**: remembers what was downloaded and never overwrites existing files.
 - **File names and locations**: original name, date-time or sequence number plus a prefix; save into your own folder with date or channel subfolders.
+- **Copy text in restricted channels**: select and Ctrl+C message text in channels with "Restrict saving content" turned on.
 - Vietnamese and English UI, light and dark theme, automatic updates.
 
 ### Compatibility

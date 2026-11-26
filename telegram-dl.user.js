@@ -1743,6 +1743,12 @@
       .sk-file .name { font-weight: 600; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .sk-file .meta { font-size: 11.5px; color: var(--sk-muted); font-variant-numeric: tabular-nums; }
       .sk-icon-btn.on { background: var(--sk-accent); color: var(--sk-accent-fg); }
+
+      /* chat "Hạn chế lưu nội dung": cho bôi đen chữ trong tin nhắn (WebK .bubble.no-forwards, WebA .Message.is-protected) */
+      .bubble.no-forwards .bubble-content, .bubble.no-forwards .message, .bubble.no-forwards .translatable-message,
+      .Message.is-protected .message-content, .Message.is-protected .text-content {
+        -webkit-user-select: text !important; user-select: text !important;
+      }
       #sk-select {
         right: max(16px, env(safe-area-inset-right));
         top: max(16px, env(safe-area-inset-top));
@@ -3357,8 +3363,29 @@
     (location.hostname === "webz.telegram.org" || location.pathname.startsWith("/a/"));
   const refreshApp = isWebK ? refreshWebK : isWebA ? refreshWebA : null;
 
+  // Chat bật "Hạn chế lưu nội dung": WebK gắn .bubble.no-forwards, WebA gắn .Message.is-protected và onCopy={stopEvent}.
+  // Nghe ở pha capture của window (chạy trước mọi handler của app) và chỉ khi vùng chọn nằm trong tin nhắn bị chặn,
+  // nên copy ở chat thường (định dạng, emoji…) vẫn do app xử lý.
+  const PROTECTED_MSG = ".bubble.no-forwards, .Message.is-protected";
+  const inProtectedMsg = (node) => (node?.nodeType === 1 ? node : node?.parentElement)?.closest?.(PROTECTED_MSG);
+  const allowProtectedCopy = () => {
+    window.addEventListener("copy", (e) => {
+      const sel = window.getSelection();
+      const text = sel?.toString();
+      if (!text || !e.clipboardData || !(inProtectedMsg(sel.anchorNode) || inProtectedMsg(sel.focusNode))) return;
+      e.clipboardData.setData("text/plain", text);
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }, true);
+    // app có thể hủy selectstart để không cho bôi đen
+    window.addEventListener("selectstart", (e) => {
+      if (inProtectedMsg(e.target)) e.stopImmediatePropagation();
+    }, true);
+  };
+
   const boot = () => {
     if (isWebK) watchHlsRequests();
+    allowProtectedCopy();
     buildUI();
     refreshAllLabels();
 

@@ -3,6 +3,11 @@
 Mọi thay đổi đáng chú ý của Telegram Media Downloader được ghi lại ở đây.
 Định dạng theo [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/), phiên bản theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+## Chưa phát hành
+
+### Thêm
+- **Copy chữ ở kênh chặn lưu**: bôi đen và Ctrl+C được chữ trong tin nhắn của kênh bật "Hạn chế lưu nội dung" (WebK và WebA). Copy ở chat thường vẫn do Telegram xử lý như cũ.
+
 ## 2.2.2
 
 ### Thêm
