@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telegram Media Downloader</title>
+  <link rel="icon" href="icons/icon-32.png">
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <header class="top">
+    <img src="icons/icon-48.png" alt="" width="40" height="40">
+    <div class="top-text">
+      <h1>Telegram Media Downloader <span class="ver"></span></h1>
+      <p data-key="optionsSub"></p>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2 data-key="secGeneral"></h2>
+      <div class="row">
+        <div class="row-text"><span data-key="lang"></span></div>
+        <div class="seg" data-setting="lang">
+          <button type="button" value="vi">Tiếng Việt</button>
+          <button type="button" value="en">English</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-text"><span data-key="connections"></span><small data-key="connectionsHint"></small></div>
+        <div class="seg" data-setting="connections">
+          <button type="button" value="1">1</button>
+          <button type="button" value="2">2</button>
+          <button type="button" value="3">3</button>
+          <button type="button" value="4">4</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-text"><span data-key="aqUntil"></span></div>
+        <select data-setting="aqUntil">
+          <option value="last" data-key="aqUntilLast"></option>
+          <option value="end" data-key="aqUntilEnd"></option>
+        </select>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 data-key="secNaming"></h2>
+      <div class="row">
+        <div class="row-text"><span data-key="naming"></span></div>
+        <select data-setting="naming">
+          <option value="original" data-key="namingOriginal"></option>
+          <option value="date" data-key="namingDate"></option>
+          <option value="seq" data-key="namingSeq"></option>
+          <option value="date_original" data-key="namingDateOriginal"></option>
+          <option value="seq_original" data-key="namingSeqOriginal"></option>
+          <option value="custom" data-key="namingCustom"></option>
+        </select>
+      </div>
+      <div class="row" id="template-row">
+        <div class="row-text"><span data-key="template"></span><small data-key="templateHint"></small></div>
+        <input type="text" data-setting="template" maxlength="120" placeholder="{channel}_{date}_{name}">
+      </div>
+      <div class="row">
+        <div class="row-text"><span data-key="prefix"></span></div>
+        <input type="text" data-setting="prefix" maxlength="60">
+      </div>
+      <div class="preview"><span data-key="namingPreview"></span> <code id="preview"></code></div>
+    </section>
+
+    <section class="card">
+      <h2 data-key="secSave"></h2>
+      <div class="row">
+        <div class="row-text"><span data-key="folder"></span><small data-key="folderPickInPage"></small></div>
+        <div class="folder">
+          <span id="folder-name"></span>
+          <button type="button" class="btn danger" id="clear-folder" data-key="clearFolder"></button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="row-text"><span data-key="subfolder"></span><small id="subfolder-hint" data-key="subfolderNeedsFolderPage"></small></div>
+        <select data-setting="subfolder">
+          <option value="none" data-key="subfolderNone"></option>
+          <option value="date" data-key="subfolderDate"></option>
+          <option value="channel" data-key="subfolderChannel"></option>
+          <option value="date_channel" data-key="subfolderDateChannel"></option>
+          <option value="channel_date" data-key="subfolderChannelDate"></option>
+        </select>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 data-key="secData"></h2>
+      <div class="row">
+        <div class="row-text"><span id="seq-info"></span></div>
+        <button type="button" class="btn" id="reset-seq" data-key="resetSeq"></button>
+      </div>
+      <div class="row">
+        <div class="row-text"><span id="downloaded-info"></span></div>
+        <button type="button" class="btn danger" id="forget" data-key="forgetDownloaded"></button>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="src/strings.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
