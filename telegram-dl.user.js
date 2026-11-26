@@ -2,7 +2,7 @@
 // @name         Telegram Media Downloader
 // @name:en      Telegram Media Downloader
 // @name:vi      Trình tải media Telegram
-// @version      2.2.2
+// @version      2.3.0
 // @namespace    sakerly
 // @description  Tải ảnh, GIF, video, voice từ Telegram Web (WebK + WebA) — engine song song kiểu client chính thức: nhiều chunk đồng thời, retry backoff, resume trong phiên, tốc độ thực + ETA.
 // @description:en  Download images, GIFs, videos and voice from Telegram Web (WebK + WebA) — official-client-style parallel engine: concurrent chunks, retry with backoff, in-session resume, real speed + ETA.
@@ -27,7 +27,7 @@
 
 
   const SCRIPT_VERSION =
-    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.2.2";
+    (typeof GM_info !== "undefined" && GM_info?.script?.version) || "2.3.0";
 
   const KB = 1024;
   const MB = 1024 * 1024;

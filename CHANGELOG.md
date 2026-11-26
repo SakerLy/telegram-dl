@@ -3,10 +3,13 @@
 Mọi thay đổi đáng chú ý của Telegram Media Downloader được ghi lại ở đây.
 Định dạng theo [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/), phiên bản theo [Semantic Versioning](https://semver.org/lang/vi/).
 
-## Chưa phát hành
+## 2.3.0
 
 ### Thêm
 - **Copy chữ ở kênh chặn lưu**: bôi đen và Ctrl+C được chữ trong tin nhắn của kênh bật "Hạn chế lưu nội dung" (WebK và WebA). Copy ở chat thường vẫn do Telegram xử lý như cũ.
+
+### Sửa lỗi
+- WebA (telegram-tt, 19/11/2026): service worker chỉ phục vụ `download/` có chữ ký do app tạo, thiếu thì 403, nên đường dự phòng "trình duyệt tự tải" (khi tải lỗi, hoặc file > 1,2 GB trên trình duyệt không có thư mục lưu) hỏng. Giờ script xin service worker ký URL như app làm; nếu không ký được thì giữ phần đã tải để **Thử lại** tiếp tục.
 
 ## 2.2.2
 
@@ -20,7 +23,6 @@ Mọi thay đổi đáng chú ý của Telegram Media Downloader được ghi l�
 - Bỏ nút Cài đặt trên panel *Tải xuống*; mở Cài đặt từ panel *Chọn hàng loạt*.
 
 ### Sửa lỗi
-- WebA (telegram-tt, 19/11/2026): service worker chỉ phục vụ `download/` có chữ ký do app tạo, thiếu thì 403, nên đường dự phòng "trình duyệt tự tải" (khi tải lỗi, hoặc file > 1,2 GB trên trình duyệt không có thư mục lưu) hỏng. Giờ script xin service worker ký URL như app làm; nếu không ký được thì giữ phần đã tải để **Thử lại** tiếp tục.
 - Không tải được video có tuỳ chọn độ phân giải trên WebK (báo nhầm "Telegram đã giải phóng media này"). WebK phát loại video này qua HLS nên nguồn là MediaSource, không đọc được dữ liệu. Giờ script tìm đúng playlist HLS của video (khớp theo thời lượng) rồi ưu tiên tải **file gốc** qua `stream/`; nếu Telegram không cho (vd file `.mov`) thì ghép các đoạn HLS thành một file mp4, chọn bản **H.264** cao nhất (HEVC/AV1 nhiều trình phát không mở được). Lưu vào thư mục lưu, đặt tên theo mẫu, có tiến trình, Tạm dừng/Tiếp tục và Thử lại như file thường.
 - Panel *Tải xuống* sau khi kéo đi chỗ khác bị tràn khỏi đáy màn hình khi thêm task, che mất tiến trình. Giờ panel neo theo mép gần hơn và không cao quá chỗ còn trống.
 - Panel thu gọn rồi kéo sát góc, khi mở rộng lại bị chui qua viền màn hình. Giờ cả hai panel neo theo mép trái/phải và trên/dưới gần hơn, và tự kéo vào trong mỗi khi đổi kích thước.
