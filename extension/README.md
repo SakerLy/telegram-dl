@@ -10,7 +10,7 @@ Bản extension (Manifest V3) tách từ userscript `telegram-dl.user.js` 2.2.2,
 | `build.mjs` | Ghép `src/` thành `content.js` |
 | `content.js` | File sinh ra, không có trong git, **đừng sửa trực tiếp** |
 | `bridge.js` | Cầu nối chạy ở isolated world: đồng bộ `chrome.storage` ↔ trang Telegram, mở trang cài đặt |
-| `options.html`, `options.css`, `options.js` | Trang cài đặt riêng của extension (dùng chung chuỗi trong `src/strings.js`) |
+| `options.html`, `options.css`, `options.js` | Trang cài đặt riêng: thanh bên điều hướng (Chung · Tên file · Nơi lưu · Dữ liệu · Giới thiệu), thẻ lựa chọn có ví dụ, chip chèn token vào mẫu tên, xác nhận 2 bước khi xoá; dùng chung chuỗi trong `src/strings.js` |
 | `icons/icon-*.png` | Icon 16/32/48/128px, thu nhỏ từ icon của Telegram Web (`web.telegram.org/k/assets/img/android-chrome-192x192.png`). Logo Telegram là thương hiệu của Telegram: dùng cá nhân, đừng đăng lên store với icon này |
 | `src/config.js` | Hằng số: chunk, retry, timeout, giới hạn |
 | `src/strings.js` | Chuỗi giao diện tiếng Việt / tiếng Anh |
@@ -39,10 +39,10 @@ Extension chạy trong **main world** của trang (`"world": "MAIN"`), tức chu
 
 ## Giao diện trong Telegram (khác userscript)
 
-- **Nút nổi tròn** ở góc màn hình: vòng quanh nút là tiến độ chung của các file đang tải, nhãn nhỏ là số task đang chạy (đỏ "!" nếu có task lỗi). Bấm để mở/đóng dock, kéo để dời chỗ (vị trí được nhớ).
+- **Nút nổi tròn** ở góc màn hình: vòng quanh nút là tiến độ chung của các file đang tải, nhãn nhỏ là số task đang chạy (đỏ "!" nếu có task lỗi). Bấm để mở/đóng dock, kéo để dời chỗ (vị trí được nhớ). Kích thước (40–80px) và độ mờ (0–80%) chỉnh trong trang cài đặt; rê chuột, đang kéo hoặc đang mở dock thì nút luôn rõ.
 - **Dock** mở về phía còn trống quanh nút nổi, gồm 3 tab: *Tải xuống* (danh sách task, tạm dừng / tiếp tục / thử lại / hủy), *Chọn* (công tắc Chế độ chọn và Auto-queue, lưới ảnh đã chọn, nút tải), *Thư mục* (chọn/đổi thư mục lưu, xem file đã lưu).
 - Thông báo ngắn (đã bỏ qua file đã tải, xong auto-queue…) hiện cạnh nút nổi.
-- Màu sắc lấy từ theme đang dùng của Telegram nên tự theo sáng/tối và màu nhấn của bạn.
+- Nền và chữ lấy từ theme đang dùng của Telegram nên tự theo sáng/tối; màu nhấn luôn là xanh Telegram.
 
 ## Cài đặt (khác userscript)
 

@@ -3,6 +3,7 @@
 let panel, selectBar, fab, toastEl; // panel = dock, selectBar = tab Chọn
 let selModeBtn, selAutoBtn, selAllBtn, selClearBtn, selDlBtn, selCount, selList, selHint, selTitle;
 let activeTab = "dl";
+let refitFab = () => {}; // canh lại nút nổi trong màn hình (gán trong makeFabDraggable)
 
 const KIND_ICON = { video: VIDEO_SVG, image: IMAGE_SVG, audio: AUDIO_SVG };
 const taskIcon = (task) =>
@@ -156,6 +157,16 @@ const placeNear = (el, anchor, gap = 10) => {
 };
 const positionDock = () => { if (panel && !panel.hidden) placeNear(panel, fab); };
 
+// kích thước và độ mờ của nút nổi (trang cài đặt); đổi kích thước thì canh lại nút và dock
+const applyFabLook = () => {
+  if (!fab) return;
+  const size = getFabSize() + "px";
+  const changed = fab.style.getPropertyValue("--sk-fab-size") !== size;
+  fab.style.setProperty("--sk-fab-size", size);
+  fab.style.setProperty("--sk-fab-opacity", String(1 - getFabFade() / 100));
+  if (changed) refitFab();
+};
+
 const setDockOpen = (open) => {
   panel.hidden = !open;
   fab.setAttribute("aria-expanded", String(open));
@@ -258,6 +269,7 @@ const buildUI = () => {
   toastEl.hidden = true;
   document.body.appendChild(toastEl);
 
+  applyFabLook();
   makeFabDraggable(fab, "fabPos", () => setDockOpen(panel.hidden));
   for (const b of panel.querySelectorAll(".sk-tab")) b.onclick = () => setTab(b.dataset.tab);
   panel.querySelector(".sk-close").onclick = () => setDockOpen(false);
@@ -359,6 +371,7 @@ const renderFileList = async () => {
 const makeFabDraggable = (el, storageKey, onClick) => {
   const place = (l, tp) => {
     const W = window.innerWidth, H = window.innerHeight, w = el.offsetWidth, h = el.offsetHeight;
+    if (!W || !H) return; // cửa sổ chưa có kích thước (tab ẩn): canh lúc này sẽ đẩy nút ra ngoài màn hình
     l = Math.max(8, Math.min(l, W - w - 8));
     tp = Math.max(8, Math.min(tp, H - h - 8));
     if (l + w / 2 > W / 2) { el.style.left = "auto"; el.style.right = (W - l - w) + "px"; }
@@ -379,6 +392,11 @@ const makeFabDraggable = (el, storageKey, onClick) => {
   };
   requestAnimationFrame(apply);
   window.addEventListener("resize", apply);
+  refitFab = () => {
+    const r = el.getBoundingClientRect();
+    place(r.left, r.top);
+    positionDock();
+  };
 
   let down = null, dragging = false;
   el.addEventListener("pointerdown", (e) => {
@@ -419,6 +437,7 @@ const makeFabDraggable = (el, storageKey, onClick) => {
 
 const refreshAllLabels = () => {
   if (!panel) return;
+  applyFabLook();
   panel.querySelector(".sk-tab[data-tab=dl] .lbl").textContent = t("downloads");
   panel.querySelector(".sk-tab[data-tab=dir] .lbl").textContent = t("tabFolder");
   panel.querySelector(".sk-task-list .sk-empty span").textContent = t("noTasks");

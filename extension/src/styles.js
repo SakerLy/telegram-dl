@@ -26,9 +26,10 @@ const STOP_SVG = svg('<path d="M18 6 6 18M6 6l12 12"/>', 16);
 const buildStyles = () => {
   const style = document.createElement("style");
   style.textContent = `
-    /* màu lấy từ theme đang dùng của Telegram (WebK: --primary-color…, WebA: --color-primary…), có giá trị dự phòng */
+    /* nền và chữ lấy từ theme đang dùng của Telegram (WebK: --surface-color…, WebA: --color-background…);
+       màu nhấn luôn là xanh Telegram, không theo màu nhấn của theme (theme tối WebK là tím) */
     #sk-fab, #sk-dock, #sk-toast {
-      --sk-accent: var(--primary-color, var(--color-primary, #3390ec));
+      --sk-accent: #3390ec;
       --sk-accent-fg: #ffffff;
       --sk-surface: var(--surface-color, var(--color-background, #ffffff));
       --sk-surface-2: var(--light-secondary-text-color-alpha, rgba(112, 117, 121, .08));
@@ -57,17 +58,21 @@ const buildStyles = () => {
     /* ---- nút nổi ---- */
     #sk-fab {
       position: fixed; z-index: 2147483646; right: 20px; bottom: 20px;
-      width: 56px; height: 56px; padding: 0; border: 0; border-radius: 50%;
+      /* --sk-fab-size, --sk-fab-opacity: tuỳ chỉnh trong trang cài đặt (applyFabLook) */
+      width: var(--sk-fab-size, 56px); height: var(--sk-fab-size, 56px); padding: 0; border: 0; border-radius: 50%;
+      opacity: var(--sk-fab-opacity, 1);
       background: var(--sk-accent); color: var(--sk-accent-fg); cursor: pointer;
       box-shadow: 0 6px 20px rgba(0, 0, 0, .25); touch-action: none; user-select: none;
-      display: grid; place-items: center; transition: transform .15s, box-shadow .15s;
+      display: grid; place-items: center; transition: transform .15s, box-shadow .15s, opacity .2s;
     }
     #sk-fab:hover { transform: scale(1.05); box-shadow: 0 8px 26px rgba(0, 0, 0, .3); }
+    /* đang dùng thì luôn rõ */
+    #sk-fab:hover, #sk-fab:focus-visible, #sk-fab.dragging, #sk-fab[aria-expanded="true"] { opacity: 1; }
     #sk-fab:focus-visible { outline: 3px solid var(--sk-accent); outline-offset: 3px; }
     #sk-fab.dragging { transition: none; transform: scale(1.08); cursor: grabbing; }
     #sk-fab .sk-fab-ic { display: grid; place-items: center; grid-area: 1 / 1; }
-    #sk-fab .sk-fab-ic svg { width: 24px; height: 24px; }
-    #sk-fab .sk-ring { grid-area: 1 / 1; width: 56px; height: 56px; transform: rotate(-90deg); pointer-events: none; }
+    #sk-fab .sk-fab-ic svg { width: calc(var(--sk-fab-size, 56px) * .43); height: calc(var(--sk-fab-size, 56px) * .43); }
+    #sk-fab .sk-ring { grid-area: 1 / 1; width: 100%; height: 100%; transform: rotate(-90deg); pointer-events: none; }
     #sk-fab .sk-ring circle { fill: none; stroke-width: 3; }
     #sk-fab .sk-ring .track { stroke: rgba(255, 255, 255, .25); }
     #sk-fab .sk-ring .val { stroke: #fff; stroke-linecap: round; transition: stroke-dashoffset .3s; }
@@ -251,13 +256,13 @@ const buildStyles = () => {
 
     /* ---- ảnh đang chọn trong chat ---- */
     .sk-sel-item {
-      position: relative; outline: 3px solid var(--primary-color, var(--color-primary, #3390ec)) !important;
+      position: relative; outline: 3px solid #3390ec !important;
       outline-offset: -3px; border-radius: 6px;
     }
-    .sk-sel { outline: 2px dashed var(--primary-color, var(--color-primary, #3390ec)) !important; outline-offset: 2px; border-radius: 8px; }
+    .sk-sel { outline: 2px dashed #3390ec !important; outline-offset: 2px; border-radius: 8px; }
     .sk-tick {
       position: absolute; top: 6px; left: 6px; z-index: 2; width: 26px; height: 26px; border-radius: 50%;
-      background: var(--primary-color, var(--color-primary, #3390ec)); color: #fff; border: 2px solid #fff;
+      background: #3390ec; color: #fff; border: 2px solid #fff;
       font: 800 14px/22px system-ui; text-align: center; pointer-events: none; box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
     }
     .sk-tick::before { content: "✓"; }

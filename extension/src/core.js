@@ -73,9 +73,12 @@ const backoffDelay = (attempt) =>
 
 const CONTENT_RANGE_RE = /^bytes (\d+)-(\d+)\/(\d+|\*)$/;
 
-const DEFAULT_SETTINGS = { naming: "original", prefix: "", template: "{date}_{name}", subfolder: "none", connections: 3, aqUntil: "last" };
+const DEFAULT_SETTINGS = { naming: "original", prefix: "", template: "{date}_{name}", subfolder: "none", connections: 3, aqUntil: "last", fabSize: 56, fabFade: 0 };
 const settings = Object.assign({}, DEFAULT_SETTINGS, loadStore("settings", {}));
 const getConnections = () => Math.min(4, Math.max(1, Number(settings.connections) || 3));
+// nút tải nổi: kích thước 40–80px, độ mờ 0–80% (không cho mờ hẳn để vẫn tìm thấy nút)
+const getFabSize = () => Math.min(80, Math.max(40, Number(settings.fabSize) || 56));
+const getFabFade = () => Math.min(80, Math.max(0, Number(settings.fabFade) || 0));
 let seqCounter = loadStore("seq", 1);
 
 const openIDB = () => new Promise((res, rej) => {
